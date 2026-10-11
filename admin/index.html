@@ -173,6 +173,13 @@
       <button class="ghost" data-cd="600">10 menit</button>
     </div>
     <div class="hint" id="cooldown-note"></div>
+    <div class="row" style="margin-top:14px">
+      <label style="margin:0; display:flex; align-items:center; gap:8px; cursor:pointer">
+        <input type="checkbox" id="native-stream" style="width:auto" />
+        ⚡ Native streaming (real-time, tanpa buffer)
+      </label>
+    </div>
+    <div class="hint" id="native-note"></div>
 
     <h2 style="margin-top:20px">Token per Akun</h2>
     <table>
@@ -578,6 +585,12 @@ function renderStats(d) {
   };
   $('strategy-desc').textContent = descs[currentStrategy] || '';
 
+  const ns = !!d.pool?.native_stream;
+  if (document.activeElement !== $('native-stream')) $('native-stream').checked = ns;
+  $('native-note').innerHTML = ns
+    ? '⚡ <b>Native streaming aktif</b> — teks dikirim real-time. Hanya untuk chat teks tanpa tools; tool-calling tetap buffered.'
+    : 'Native streaming nonaktif — jawaban di-buffer lalu dikirim (streaming kosmetik).';
+
   // Per-account token table.
   const body = $('m-accounts');
   const rows = d.per_account || [];
@@ -605,7 +618,7 @@ async function savePool() {
   try {
     const res = await fetch('/admin/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cooldownMs: Number.isFinite(sec) ? sec * 1000 : undefined }),
+      body: JSON.stringify({ cooldownMs: Number.isFinite(sec) ? sec * 1000 : undefined, nativeStream: $('native-stream').checked }),
     });
     const d = await res.json();
     if (!res.ok) throw new Error(d?.error?.message || ('HTTP ' + res.status));

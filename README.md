@@ -440,6 +440,30 @@ The `/admin` Web UI shows live monitoring:
 
 Data comes from `GET /admin/api/stats`, accumulated in memory (reset on restart).
 
+### Native streaming (real-time)
+
+By default the proxy **buffers** the whole DeepSeek answer and then replays it as SSE
+chunks ("cosmetic streaming"). Enable **⚡ Native streaming** in the Web UI (or set
+`nativeStream: true` via `POST /admin/api/settings`, or `DEEPSEEK_NATIVE_STREAM=1`) to
+forward DeepSeek fragments to the client **as they arrive**.
+
+- Applies to plain-text **OpenAI** streams with **no tools** only.
+- Tool-calling requests always use the buffered path (tool markup needs the full text).
+- If the upstream rewrites earlier text instead of appending, the proxy detects the
+  divergence and closes the stream with what was already sent.
+- Empty-response retry/continuation cannot run once bytes are committed, so a native
+  stream that starts is never retried.
+
+Measured on a warm session (3-sentence answer):
+
+| Mode | Time to first chunk | Total |
+| --- | --- | --- |
+| Native | ~1.2s | ~1.8s |
+| Buffered | ~1.5s | ~1.5s |
+
+Native delivers the first token sooner and renders progressively; buffered finishes
+slightly earlier overall because it skips per-chunk overhead.
+
 ### Verifying the pool is really connected
 
 Checking files on disk is not enough — you want to know DeepSeek actually accepted

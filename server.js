@@ -235,8 +235,12 @@ function recordCompletion({ accountId, model, usage, elapsedMs, ok = true, rateL
 // The settings are persisted so a UI change (e.g. disabling cooldown) survives a restart.
 const POOL_SETTINGS_PATH = path.join(__dirname, 'pool-settings.json');
 const poolSettings = {
-    strategy: process.env.DEEPSEEK_POOL_STRATEGY || 'round-robin', // round-robin | least-used | sequential
+    strategy: process.env.DEEPSEEK_POOL_STRATEGY || 'round-robin', // round-robin | least-used | sequential | per-request
     cooldownMs: DEFAULT_ACCOUNT_COOLDOWN_MS,
+    // Native streaming: forward DeepSeek fragments to the client in real time
+    // instead of buffering the whole answer and replaying it. Only used for
+    // plain-text OpenAI streams (no tools); tool-calling keeps the buffered path.
+    nativeStream: /^(1|true|yes|on)$/i.test(String(process.env.DEEPSEEK_NATIVE_STREAM || '')),
 };
 function getPoolSettings() { return { ...poolSettings }; }
 function setPoolSettings(patch = {}) {
@@ -245,6 +249,7 @@ function setPoolSettings(patch = {}) {
     // 0 means "cooldown disabled": failure/rate-limit signals no longer lock an
     // account out, and the pool keeps rotating on retry instead.
     if (Number.isFinite(cd) && cd >= 0) poolSettings.cooldownMs = Math.floor(cd);
+    if (typeof patch.nativeStream === 'boolean') poolSettings.nativeStream = patch.nativeStream;
     if (patch.persist !== false) savePoolSettings();
     return getPoolSettings();
 }
@@ -255,14 +260,15 @@ function loadPoolSettings() {
         if (['round-robin', 'least-used', 'sequential', 'per-request'].includes(raw.strategy)) poolSettings.strategy = raw.strategy;
         const cd = Number(raw.cooldownMs);
         if (Number.isFinite(cd) && cd >= 0) poolSettings.cooldownMs = Math.floor(cd);
-        console.log(`[DS-API] Loaded pool settings: strategy=${poolSettings.strategy}, cooldownMs=${poolSettings.cooldownMs}`);
+        if (typeof raw.nativeStream === 'boolean') poolSettings.nativeStream = raw.nativeStream;
+        console.log(`[DS-API] Loaded pool settings: strategy=${poolSettings.strategy}, cooldownMs=${poolSettings.cooldownMs}, nativeStream=${poolSettings.nativeStream}`);
     } catch (e) {
         if (e.code !== 'ENOENT') console.error(`[DS-API] Could not read pool-settings.json: ${e.message}`);
     }
 }
 function savePoolSettings() {
     try {
-        fs.writeFileSync(POOL_SETTINGS_PATH, JSON.stringify({ strategy: poolSettings.strategy, cooldownMs: poolSettings.cooldownMs }, null, 2));
+        fs.writeFileSync(POOL_SETTINGS_PATH, JSON.stringify({ strategy: poolSettings.strategy, cooldownMs: poolSettings.cooldownMs, nativeStream: poolSettings.nativeStream }, null, 2));
     } catch (e) {
         console.error(`[DS-API] Could not write pool-settings.json: ${e.message}`);
     }
@@ -1942,6 +1948,41 @@ function sendResponsesStream(res, openaiResp) {
     res.end();
 }
 
+// === Native streaming (OpenAI SSE) ===
+// Streams DeepSeek fragments to the client as they arrive instead of buffering
+// the whole answer. Only used for plain-text OpenAI streams with no tools; the
+// caller falls back to the buffered path if the upstream rewrites earlier text.
+function createNativeOpenAIStream(res, model) {
+    const id = 'ds-' + Date.now();
+    const created = Math.floor(Date.now() / 1000);
+    let started = false;
+    let closed = false;
+    const writeChunk = (delta, finishReason = null) => {
+        if (closed) return;
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`);
+    };
+    return {
+        get started() { return started; },
+        get closed() { return closed; },
+        start() {
+            if (started || closed) return;
+            started = true;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+            writeChunk({ role: 'assistant', content: '' });
+        },
+        content(text) { if (text) writeChunk({ content: text }); },
+        reasoning(text) { if (text) writeChunk({ reasoning_content: text }); },
+        finish(reason = 'stop') {
+            if (closed) return;
+            writeChunk({}, reason);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            closed = true;
+        },
+        abort() { closed = true; },
+    };
+}
+
 function sendOpenAIStream(res, openaiResp) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     const choice = openaiResp.choices[0];
@@ -2388,6 +2429,7 @@ const server = http.createServer(async (req, res) => {
                 strategy: poolSettings.strategy,
                 cooldown_ms: poolSettings.cooldownMs,
                 cooldown_enabled: cooldownEnabled(),
+                native_stream: poolSettings.nativeStream,
                 accounts_total: accounts.length,
                 accounts_ready: accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length,
                 in_flight: inFlight,
@@ -2693,7 +2735,10 @@ const server = http.createServer(async (req, res) => {
             }
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
-            async function readDeepSeekResponse(readable) {
+            // When onDelta is provided, newly-arrived text is forwarded in real time
+            // (native streaming). If the upstream ever rewrites earlier text instead
+            // of appending, streamDiverged is set and the caller falls back to buffered.
+            async function readDeepSeekResponse(readable, onDelta = null) {
                 let buffer = '';
                 let lastPath = null;
                 const fragments = [];
@@ -2702,11 +2747,30 @@ const server = http.createServer(async (req, res) => {
                 let newMessageId = null;
                 let finishReason = null;
                 let modelError = null;
+                let emittedContent = '';
+                let emittedReasoning = '';
+                let streamDiverged = false;
 
                 const rebuildFragmentState = () => {
                     const { responseText, thinkText } = rebuildFragmentText(fragments);
                     if (responseText) fullContent = responseText;
                     reasoningContent = thinkText;
+                };
+
+                const emitDeltas = () => {
+                    if (!onDelta || streamDiverged) return;
+                    if (reasoningContent.length > emittedReasoning.length) {
+                        if (reasoningContent.startsWith(emittedReasoning)) {
+                            onDelta({ reasoning: reasoningContent.slice(emittedReasoning.length) });
+                            emittedReasoning = reasoningContent;
+                        } else { streamDiverged = true; return; }
+                    }
+                    if (fullContent.length > emittedContent.length) {
+                        if (fullContent.startsWith(emittedContent)) {
+                            onDelta({ content: fullContent.slice(emittedContent.length) });
+                            emittedContent = fullContent;
+                        } else { streamDiverged = true; }
+                    }
                 };
 
                 const appendFragments = (value) => {
@@ -2772,6 +2836,7 @@ const server = http.createServer(async (req, res) => {
                                     finishReason = d.v;
                                 }
                             } catch (e) { }
+                            emitDeltas();
                         }
                     }
                 }
@@ -2783,10 +2848,22 @@ const server = http.createServer(async (req, res) => {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
 
-                return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
+                return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError, streamDiverged };
             }
 
-            let { content: fullContent, reasoningContent, finishReason, modelError } = await readDeepSeekResponse(dsResp.body);
+            // Native streaming is only safe for plain-text OpenAI streams with no
+            // tools: tool-call markup needs the full text, and retry/continuation
+            // need to decide before the first byte is committed to the client.
+            const nativeStream = stream && apiMode === 'openai' && tools.length === 0 && poolSettings.nativeStream;
+            const native = nativeStream ? createNativeOpenAIStream(res, effectiveModel) : null;
+            const onDelta = native ? (d) => {
+                if (clientGone) return;
+                native.start();
+                if (d.reasoning) native.reasoning(d.reasoning);
+                if (d.content) native.content(d.content);
+            } : null;
+
+            let { content: fullContent, reasoningContent, finishReason, modelError, streamDiverged } = await readDeepSeekResponse(dsResp.body, onDelta);
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
             const elapsed = Date.now() - startTime;
@@ -2802,6 +2879,14 @@ const server = http.createServer(async (req, res) => {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
+                // Native streaming already committed bytes to the client, so we can
+                // no longer retry with a different prompt/account. Close the stream.
+                if (native && native.started) {
+                    console.log(`${agentTag} native stream already started; cannot retry empty response.`);
+                    native.finish('stop');
+                    recordCompletion({ accountId: activeAccount?.id, model: effectiveModel, elapsedMs: Date.now() - startTime, ok: false });
+                    return;
+                }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
                 const rateLimited = isRateLimitError(modelError);
@@ -2928,11 +3013,25 @@ const server = http.createServer(async (req, res) => {
                     fullContent += '\n' + contContent;
                     if (contReasoning) reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
                     finishReason = contResult.finishReason;
+                    if (native && native.started) native.content('\n' + contContent);
                     console.log(`${agentTag} Continuation added ${contContent.length} chars (total: ${fullContent.length})`);
                 } else {
                     console.log(`${agentTag} Continuation returned nothing useful, stopping`);
                     break;
                 }
+            }
+
+            // Native streaming: the client already received the text in real time.
+            // Close the SSE stream here and skip the buffered replay path.
+            if (native && native.started) {
+                if (streamDiverged) {
+                    console.log(`${agentTag} native stream diverged (upstream rewrote text); closing with what was sent.`);
+                }
+                native.finish(finishReason === 'length' ? 'length' : 'stop');
+                storeHistory(agentId, prompt, fullContent, null);
+                recordCompletion({ accountId: activeAccount?.id, model: effectiveModel, usage: buildUsage(clientPromptText, fullContent, reasoningContent), elapsedMs: Date.now() - startTime, ok: true });
+                console.log(`${agentTag} Native-streamed openai in ${Date.now() - startTime}ms (${fullContent.length} chars)`);
+                return;
             }
 
             const allowedToolNames = new Set(tools

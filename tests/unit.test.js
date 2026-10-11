@@ -595,7 +595,10 @@ test('account test script discovers the accounts directory and builds auth heade
 test('pool settings accept only known strategies and sane cooldowns', () => {
   const original = serverInternals.getPoolSettings();
   try {
-    assert.deepEqual(serverInternals.setPoolSettings({ strategy: 'least-used', cooldownMs: 120000, persist: false }), { strategy: 'least-used', cooldownMs: 120000 });
+    const applied = serverInternals.setPoolSettings({ strategy: 'least-used', cooldownMs: 120000, persist: false });
+    assert.equal(applied.strategy, 'least-used');
+    assert.equal(applied.cooldownMs, 120000);
+    assert.equal(typeof applied.nativeStream, 'boolean');
     assert.equal(serverInternals.setPoolSettings({ strategy: 'bogus', persist: false }).strategy, 'least-used');
     // Cooldown 0 is valid and means "disabled".
     assert.equal(serverInternals.setPoolSettings({ cooldownMs: 0, persist: false }).cooldownMs, 0);
@@ -627,6 +630,16 @@ test('per-request strategy is accepted and rotates across the ready set', () => 
     const picks = new Set();
     for (let i = 0; i < 6; i++) picks.add(serverInternals.selectAccountByStrategy(ready).id);
     assert.equal(picks.size, 3);
+  } finally {
+    serverInternals.setPoolSettings({ ...original, persist: false });
+  }
+});
+
+test('nativeStream setting toggles and is reported by getPoolSettings', () => {
+  const original = serverInternals.getPoolSettings();
+  try {
+    assert.equal(serverInternals.setPoolSettings({ nativeStream: true, persist: false }).nativeStream, true);
+    assert.equal(serverInternals.setPoolSettings({ nativeStream: false, persist: false }).nativeStream, false);
   } finally {
     serverInternals.setPoolSettings({ ...original, persist: false });
   }
