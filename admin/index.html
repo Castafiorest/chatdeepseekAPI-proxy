@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FreeDeepseekAPI · Account Manager</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #121826;
+    --panel-2: #1a2233;
+    --border: #263149;
+    --text: #e6ecf7;
+    --muted: #8b98b3;
+    --accent: #4f8cff;
+    --accent-2: #7c5cff;
+    --ok: #2ecc71;
+    --warn: #f5a623;
+    --err: #ff5c5c;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2540 0%, var(--bg) 55%);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+  .logo {
+    width: 44px; height: 44px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center; font-weight: 800; font-size: 20px;
+    box-shadow: 0 8px 24px rgba(79,140,255,.35);
+  }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 22px 0; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  .stat .v { font-size: 26px; font-weight: 700; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 18px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 14px; letter-spacing: .3px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff; border: 0; border-radius: 10px; padding: 10px 16px;
+    font-size: 13px; font-weight: 600; cursor: pointer; transition: transform .08s, opacity .2s;
+  }
+  button:hover { transform: translateY(-1px); }
+  button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: linear-gradient(135deg, #ff5c5c, #d63b3b); }
+  input, textarea {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 10px; padding: 11px 13px; font-size: 13px;
+    font-family: inherit;
+  }
+  textarea { min-height: 130px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  tr:last-child td { border-bottom: 0; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .badge.ok { background: rgba(46,204,113,.14); color: var(--ok); }
+  .badge.warn { background: rgba(245,166,35,.14); color: var(--warn); }
+  .badge.err { background: rgba(255,92,92,.14); color: var(--err); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 18px; font-size: 13px; opacity: 0; transition: all .25s; pointer-events: none;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.ok { border-color: rgba(46,204,113,.5); }
+  .toast.err { border-color: rgba(255,92,92,.5); }
+  .empty { color: var(--muted); font-size: 13px; padding: 18px 0; text-align: center; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.5; }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+  .steps { counter-reset: step; margin: 0 0 16px; padding: 0; list-style: none; }
+  .steps li { position: relative; padding-left: 34px; margin-bottom: 10px; font-size: 13px; color: var(--text); line-height: 1.5; }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: -1px; width: 22px; height: 22px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center; font-size: 11px; font-weight: 700;
+  }
+  .steps li.done::before { background: rgba(46,204,113,.2); color: var(--ok); content: "✓"; }
+  .login-status {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); font-size: 13px; margin-top: 6px;
+  }
+  #login-panel { border: 1px solid rgba(79,140,255,.35); background: linear-gradient(180deg, rgba(79,140,255,.06), transparent); }
+  .spin { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .seg button { background: transparent; border-radius: 0; box-shadow: none; padding: 9px 14px; transform: none; }
+  .seg button.active { background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+  select { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
+  .chart { display: flex; align-items: flex-end; gap: 3px; height: 70px; margin-top: 8px; }
+  .chart .bar { flex: 1; background: linear-gradient(180deg, var(--accent), var(--accent-2)); border-radius: 3px 3px 0 0; min-height: 2px; opacity: .85; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">DS</div>
+    <div>
+      <h1>FreeDeepseekAPI · Account Manager</h1>
+      <div class="sub">Kelola pool akun DeepSeek Web untuk proxy lokal</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Total akun</div><div class="v" id="stat-total">–</div></div>
+    <div class="stat"><div class="k">Siap pakai</div><div class="v" id="stat-ready" style="color:var(--ok)">–</div></div>
+    <div class="stat"><div class="k">Cooldown</div><div class="v" id="stat-cooldown" style="color:var(--warn)">–</div></div>
+    <div class="stat"><div class="k">Config</div><div class="v" id="stat-config" style="font-size:18px">–</div></div>
+  </div>
+
+  <div class="card" id="monitor-panel">
+    <h2>📊 Monitoring Token &amp; Pool</h2>
+    <div class="grid" style="margin:14px 0 6px">
+      <div class="stat"><div class="k">Total request</div><div class="v" id="m-requests">–</div></div>
+      <div class="stat"><div class="k">Total token</div><div class="v" id="m-tokens">–</div></div>
+      <div class="stat"><div class="k">Prompt / Completion</div><div class="v" id="m-split" style="font-size:16px">–</div></div>
+      <div class="stat"><div class="k">Rate-limited</div><div class="v" id="m-rl" style="color:var(--warn)">–</div></div>
+      <div class="stat"><div class="k">Avg token/req</div><div class="v" id="m-avg" style="font-size:18px">–</div></div>
+      <div class="stat"><div class="k">Req/menit</div><div class="v" id="m-rpm" style="font-size:18px">–</div></div>
+      <div class="stat"><div class="k">In-flight</div><div class="v" id="m-inflight" style="font-size:18px">–</div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v" id="m-uptime" style="font-size:18px">–</div></div>
+    </div>
+    <div class="hint" style="margin-bottom:6px">Pemakaian token per request (50 terakhir, terbaru di kiri)</div>
+    <div class="chart" id="m-chart"></div>
+
+    <h2 style="margin-top:20px">⚙️ Strategi Pool Akun</h2>
+    <div class="row" style="margin:10px 0">
+      <div class="seg" id="strategy-seg">
+        <button data-strategy="round-robin">Round-robin</button>
+        <button data-strategy="least-used">Least-used</button>
+        <button data-strategy="sequential">Sequential</button>
+        <button data-strategy="per-request">Per-request</button>
+      </div>
+      <span class="mono" id="strategy-note"></span>
+    </div>
+    <div class="hint" id="strategy-desc"></div>
+    <div class="row">
+      <label style="margin:0; display:flex; align-items:center; gap:8px">
+        Cooldown (detik)
+        <input id="cooldown-sec" type="number" min="0" style="width:110px" />
+      </label>
+      <button id="btn-save-pool">Simpan</button>
+      <button class="ghost" id="btn-reset-metrics">Reset metrik</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="muted" style="font-size:12px">Preset:</span>
+      <button class="ghost" data-cd="0">Nonaktifkan (0s)</button>
+      <button class="ghost" data-cd="30">30s</button>
+      <button class="ghost" data-cd="60">1 menit</button>
+      <button class="ghost" data-cd="300">5 menit</button>
+      <button class="ghost" data-cd="600">10 menit</button>
+    </div>
+    <div class="hint" id="cooldown-note"></div>
+
+    <h2 style="margin-top:20px">Token per Akun</h2>
+    <table>
+      <thead><tr><th>Akun</th><th>File</th><th>Request</th><th>Sukses</th><th>Gagal</th><th>Rate-limit</th><th>Total token</th></tr></thead>
+      <tbody id="m-accounts"><tr><td colspan="7" class="empty">Memuat…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="login-panel">
+    <h2>🔐 Tambah Akun via Login Chrome</h2>
+    <p class="hint" style="margin-top:0">
+      Login DeepSeek lewat browser tanpa <code>npm run auth</code>. Server akan membuka jendela Chrome khusus;
+      kamu login di sana, lalu klik <b>Selesai — simpan akun</b>.
+    </p>
+    <ol class="steps" id="login-steps">
+      <li id="step-1">Klik <b>Buka Chrome &amp; Login</b></li>
+      <li id="step-2">Login DeepSeek di jendela Chrome yang muncul</li>
+      <li id="step-3">Kirim 1 pesan singkat (mis. <code>ok</code>) di chat DeepSeek</li>
+      <li id="step-4">Klik <b>Selesai — simpan akun</b> di sini</li>
+    </ol>
+    <div class="row">
+      <input id="login-name" placeholder="Nama file (opsional), mis. account2" style="flex:1; min-width:220px" />
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btn-login-start">🌐 Buka Chrome &amp; Login</button>
+      <button id="btn-login-finalize" class="ghost" disabled>✅ Selesai — simpan akun</button>
+      <button id="btn-login-cancel" class="ghost" disabled>Batal</button>
+    </div>
+    <div class="login-status" id="login-status"><span class="dot" style="background:var(--muted)"></span><span id="login-status-text">Belum ada sesi login.</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Daftar Akun</h2>
+    <div class="row" style="justify-content:space-between; margin-bottom:10px">
+      <div class="mono" id="accounts-dir">–</div>
+      <div class="row">
+        <button class="ghost" id="btn-test">🔌 Test Koneksi</button>
+        <button class="ghost" id="btn-reload">↻ Reload dari disk</button>
+      </div>
+    </div>
+    <div id="test-result" class="hint" style="display:none"></div>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>File</th><th>Status</th><th>Cooldown</th><th>Failures</th><th>Terakhir dipakai</th><th></th></tr>
+      </thead>
+      <tbody id="accounts-body">
+        <tr><td colspan="7" class="empty">Memuat…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Tambah Akun</h2>
+    <label for="acc-name">Nama file (opsional)</label>
+    <input id="acc-name" placeholder="mis. account2" />
+    <label for="acc-json">Tempel isi <code>deepseek-auth.json</code> atau export cookie browser</label>
+    <textarea id="acc-json" placeholder='{"token":"...","cookie":"...","hif_dliq":"...","hif_leim":"..."}'></textarea>
+    <div class="row" style="margin-top:14px">
+      <button id="btn-add">+ Tambah akun</button>
+      <button class="ghost" id="btn-clear">Bersihkan</button>
+    </div>
+    <div class="hint">
+      Cara termudah: jalankan <code>npm run auth</code> di akun DeepSeek yang berbeda, lalu tempel isi
+      <code>deepseek-auth.json</code> di sini. Setiap akun harus login DeepSeek yang berbeda.
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let toastTimer = null;
+
+function toast(msg, kind = 'ok') {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + kind;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = 'toast ' + kind; }, 3200);
+}
+
+function fmtTime(ts) {
+  if (!ts) return '–';
+  const d = new Date(ts);
+  return d.toLocaleTimeString();
+}
+
+function fmtCooldown(sec) {
+  if (!sec || sec <= 0) return '–';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function render(data) {
+  $('stat-total').textContent = data.total ?? 0;
+  $('stat-ready').textContent = data.ready ?? 0;
+  const cooling = (data.accounts || []).filter(a => a.cooldown).length;
+  $('stat-cooldown').textContent = cooling;
+  $('stat-config').textContent = data.config_ready ? '✅ siap' : '❌ belum ada';
+  $('stat-config').style.color = data.config_ready ? 'var(--ok)' : 'var(--err)';
+  $('accounts-dir').textContent = data.accounts_dir || '';
+
+  const body = $('accounts-body');
+  const list = data.accounts || [];
+  if (list.length === 0) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">Belum ada akun. Tambahkan di bawah.</td></tr>';
+    return;
+  }
+  body.innerHTML = list.map(a => {
+    let badge;
+    if (!a.ready) badge = '<span class="badge err"><span class="dot"></span>tidak valid</span>';
+    else if (a.cooldown) badge = '<span class="badge warn"><span class="dot"></span>cooldown</span>';
+    else badge = '<span class="badge ok"><span class="dot"></span>siap</span>';
+    return `<tr>
+      <td class="mono">${a.id}</td>
+      <td class="mono">${a.file || '–'}</td>
+      <td>${badge}</td>
+      <td>${a.cooldown ? fmtCooldown(a.cooldown_remaining_sec) : '–'}</td>
+      <td>${a.failures ?? 0}</td>
+      <td class="mono">${fmtTime(a.last_used_at)}</td>
+      <td><button class="danger" data-del="${a.file}">Hapus</button></td>
+    </tr>`;
+  }).join('');
+
+  body.querySelectorAll('[data-del]').forEach(btn => {
+    btn.addEventListener('click', () => deleteAccount(btn.getAttribute('data-del')));
+  });
+}
+
+async function load() {
+  try {
+    const res = await fetch('/admin/api/accounts');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    render(await res.json());
+  } catch (e) {
+    toast('Gagal memuat akun: ' + e.message, 'err');
+  }
+}
+
+async function addAccount() {
+  const raw = $('acc-json').value.trim();
+  if (!raw) { toast('Tempel JSON auth dulu', 'err'); return; }
+  let auth;
+  try { auth = JSON.parse(raw); }
+  catch (e) { toast('JSON tidak valid: ' + e.message, 'err'); return; }
+  const name = $('acc-name').value.trim();
+  $('btn-add').disabled = true;
+  try {
+    const res = await fetch('/admin/api/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auth, name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+    toast('Akun ditambahkan: ' + data.file + ' (total ' + data.total + ')');
+    $('acc-json').value = '';
+    $('acc-name').value = '';
+    render({ accounts: data.accounts, total: data.total, ready: data.accounts.filter(a => a.ready && !a.cooldown).length, accounts_dir: $('accounts-dir').textContent, config_ready: true });
+    load();
+  } catch (e) {
+    toast('Gagal menambah: ' + e.message, 'err');
+  } finally {
+    $('btn-add').disabled = false;
+  }
+}
+
+async function deleteAccount(file) {
+  if (!file) return;
+  if (!confirm('Hapus akun ' + file + '?')) return;
+  try {
+    const res = await fetch('/admin/api/accounts/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+    toast('Akun dihapus: ' + data.removed);
+    load();
+  } catch (e) {
+    toast('Gagal menghapus: ' + e.message, 'err');
+  }
+}
+
+async function reload() {
+  try {
+    const res = await fetch('/admin/api/reload', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+    toast('Reload selesai (' + data.total + ' akun)');
+    load();
+  } catch (e) {
+    toast('Gagal reload: ' + e.message, 'err');
+  }
+}
+
+async function testAccounts() {
+  const box = $('test-result');
+  const btn = $('btn-test');
+  btn.disabled = true;
+  box.style.display = 'block';
+  box.innerHTML = '<span class="spin" style="display:inline-block;vertical-align:middle"></span> Menguji tiap akun ke DeepSeek (bisa ~beberapa detik)…';
+  try {
+    const res = await fetch('/admin/api/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ create_session: true }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+    const rows = (data.results || []).map(r => {
+      const ok = r.live;
+      const icon = ok ? '✅' : (r.auth_ok ? '⚠️' : '❌');
+      const note = ok ? 'connected' + (r.session_id ? ' · session ' + String(r.session_id).substring(0, 8) + '…' : '') : (r.error || 'tidak terkoneksi');
+      return `<div style="padding:4px 0"><b>${r.id}</b> <span class="mono">${r.file}</span> — ${icon} ${note}</div>`;
+    }).join('');
+    box.innerHTML = `<div style="margin-bottom:6px"><b>${data.live}/${data.total} akun terhubung</b> (${data.elapsed_ms} ms)</div>${rows}`;
+    toast(`${data.live}/${data.total} akun terhubung`, data.live === data.total ? 'ok' : 'err');
+    load();
+  } catch (e) {
+    box.innerHTML = 'Gagal tes: ' + e.message;
+    toast('Gagal tes: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('btn-add').addEventListener('click', addAccount);
+$('btn-reload').addEventListener('click', reload);
+$('btn-test').addEventListener('click', testAccounts);
+$('btn-clear').addEventListener('click', () => { $('acc-json').value = ''; $('acc-name').value = ''; });
+
+load();
+setInterval(load, 5000);
+
+// ---- Browser login flow ----
+let loginPoll = null;
+
+function renderLoginStatus(s) {
+  const txt = $('login-status-text');
+  const badge = $('login-status').querySelector('.dot');
+  const startBtn = $('btn-login-start');
+  const finBtn = $('btn-login-finalize');
+  const cancelBtn = $('btn-login-cancel');
+  const mark = (n, done) => { const el = $('step-' + n); if (el) el.className = done ? 'done' : ''; };
+
+  if (!s.chrome_found) {
+    badge.style.background = 'var(--err)';
+    txt.textContent = 'Chrome tidak ditemukan. Set CHROME_PATH lalu restart server.';
+    startBtn.disabled = true; finBtn.disabled = true; cancelBtn.disabled = true;
+    return;
+  }
+  startBtn.disabled = false; finBtn.disabled = true; cancelBtn.disabled = true;
+  mark(1, false); mark(2, false); mark(3, false); mark(4, false);
+
+  switch (s.state) {
+    case 'starting':
+      badge.style.background = 'var(--accent)';
+      txt.innerHTML = '<span class="spin"></span> Membuka Chrome… login di jendela yang muncul.';
+      mark(1, true);
+      cancelBtn.disabled = false;
+      break;
+    case 'awaiting':
+      badge.style.background = 'var(--warn)';
+      txt.innerHTML = 'Chrome terbuka. Login DeepSeek + kirim 1 pesan singkat, lalu klik <b>Selesai — simpan akun</b>.';
+      mark(1, true); mark(2, true); mark(3, true);
+      finBtn.disabled = false; cancelBtn.disabled = false;
+      break;
+    case 'capturing':
+      badge.style.background = 'var(--accent)';
+      txt.innerHTML = '<span class="spin"></span> Mengambil token & cookie…';
+      finBtn.disabled = true; cancelBtn.disabled = true;
+      break;
+    case 'done':
+      badge.style.background = 'var(--ok)';
+      txt.textContent = 'Selesai. Akun tersimpan.';
+      mark(1, true); mark(2, true); mark(3, true); mark(4, true);
+      break;
+    case 'cancelled':
+      badge.style.background = 'var(--muted)';
+      txt.textContent = 'Login dibatalkan.';
+      break;
+    case 'error':
+      badge.style.background = 'var(--err)';
+      txt.textContent = 'Error: ' + (s.error || 'tidak diketahui');
+      break;
+    default:
+      badge.style.background = 'var(--muted)';
+      txt.textContent = 'Belum ada sesi login.';
+  }
+}
+
+async function pollLoginStatus() {
+  try {
+    const res = await fetch('/admin/api/login/status');
+    const s = await res.json();
+    renderLoginStatus(s);
+    if (s.state === 'awaiting' || s.state === 'starting' || s.state === 'capturing') {
+      if (!loginPoll) loginPoll = setInterval(pollLoginStatus, 2000);
+    } else if (loginPoll) {
+      clearInterval(loginPoll); loginPoll = null;
+    }
+  } catch (e) { /* ignore transient */ }
+}
+
+async function startLogin() {
+  $('btn-login-start').disabled = true;
+  try {
+    const res = await fetch('/admin/api/login/start', { method: 'POST' });
+    const s = await res.json();
+    if (!res.ok) throw new Error(s?.error?.message || ('HTTP ' + res.status));
+    renderLoginStatus(s);
+    if (!loginPoll) loginPoll = setInterval(pollLoginStatus, 2000);
+    toast('Chrome dibuka. Login lalu klik Selesai.');
+  } catch (e) {
+    toast('Gagal membuka Chrome: ' + e.message, 'err');
+    $('btn-login-start').disabled = false;
+  }
+}
+
+async function finalizeLogin() {
+  const name = $('login-name').value.trim();
+  $('btn-login-finalize').disabled = true;
+  try {
+    const res = await fetch('/admin/api/login/finalize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+    toast('Akun tersimpan: ' + data.file + ' (total ' + data.total + ')');
+    $('login-name').value = '';
+    pollLoginStatus();
+    load();
+  } catch (e) {
+    toast('Gagal menyimpan: ' + e.message, 'err');
+    $('btn-login-finalize').disabled = false;
+  }
+}
+
+async function cancelLogin() {
+  try { await fetch('/admin/api/login/cancel', { method: 'POST' }); } catch (e) { /* ignore */ }
+  pollLoginStatus();
+  toast('Login dibatalkan');
+}
+
+$('btn-login-start').addEventListener('click', startLogin);
+$('btn-login-finalize').addEventListener('click', finalizeLogin);
+$('btn-login-cancel').addEventListener('click', cancelLogin);
+pollLoginStatus();
+
+// ---- Monitoring + pool strategy ----
+function fmtNum(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function fmtUptime(sec) {
+  sec = Number(sec) || 0;
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h > 0 ? `${h}j ${m}m` : (m > 0 ? `${m}m ${s}s` : `${s}s`);
+}
+let currentStrategy = 'round-robin';
+
+function renderStats(d) {
+  const t = d.totals || {};
+  $('m-requests').textContent = fmtNum(t.requests);
+  $('m-tokens').textContent = fmtNum(t.total_tokens);
+  $('m-split').textContent = fmtNum(t.prompt_tokens) + ' / ' + fmtNum(t.completion_tokens);
+  $('m-rl').textContent = fmtNum(t.rate_limited);
+  $('m-avg').textContent = fmtNum(d.avg_tokens_per_request);
+  $('m-rpm').textContent = d.rpm;
+  $('m-inflight').textContent = `${d.pool?.in_flight ?? 0}/${d.pool?.max_concurrent ?? '?'}`;
+  $('m-uptime').textContent = fmtUptime(d.uptime_sec);
+
+  // Bar chart: total tokens per recent request.
+  const recent = (d.recent || []).slice(0, 50).reverse();
+  const max = Math.max(1, ...recent.map(r => r.total_tokens || 0));
+  $('m-chart').innerHTML = recent.length
+    ? recent.map(r => `<div class="bar" title="${r.total_tokens} tokens · ${r.model || ''} · ${r.account || ''}${r.ok ? '' : ' · gagal'}" style="height:${Math.round((r.total_tokens || 1) / max * 100)}%;${r.ok ? '' : 'background:linear-gradient(180deg,#ff5c5c,#d63b3b)'}"></div>`).join('')
+    : '<div class="muted" style="font-size:12px">Belum ada request.</div>';
+
+  // Pool strategy segment.
+  currentStrategy = d.pool?.strategy || 'round-robin';
+  document.querySelectorAll('#strategy-seg button').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('data-strategy') === currentStrategy);
+  });
+  if (document.activeElement !== $('cooldown-sec')) {
+    $('cooldown-sec').value = Math.round((d.pool?.cooldown_ms || 0) / 1000);
+  }
+  const cdSec = Math.round((d.pool?.cooldown_ms || 0) / 1000);
+  $('cooldown-note').innerHTML = cdSec === 0
+    ? '⛔ Cooldown <b>dimatikan</b>. Akun yang kena limit tetap dipakai lagi (tetap rotasi antar akun saat error).'
+    : `Akun dikunci selama <b>${cdSec}s</b> setelah kena 401/403/429.`;
+  $('strategy-note').textContent = `${d.pool?.accounts_ready ?? 0}/${d.pool?.accounts_total ?? 0} akun siap · counter=${d.pool?.round_robin_counter ?? 0}`;
+  const descs = {
+    'round-robin': 'Bergilir antar akun saat agent/sesi baru dibuat (sticky per sesi).',
+    'least-used': 'Pilih akun dengan request paling sedikit (sticky per sesi).',
+    'sequential': 'Selalu akun pertama yang siap (sticky per sesi).',
+    'per-request': '⚡ Rotasi tiap request — beban paling merata. Konteks tetap utuh karena Copilot mengirim ulang seluruh riwayat tiap turn.',
+  };
+  $('strategy-desc').textContent = descs[currentStrategy] || '';
+
+  // Per-account token table.
+  const body = $('m-accounts');
+  const rows = d.per_account || [];
+  body.innerHTML = rows.length ? rows.map(a => `<tr>
+      <td class="mono">${a.id}</td>
+      <td class="mono">${a.file || '–'}</td>
+      <td>${fmtNum(a.requests)}</td>
+      <td style="color:var(--ok)">${fmtNum(a.successes)}</td>
+      <td style="color:var(--err)">${fmtNum(a.failures)}</td>
+      <td style="color:var(--warn)">${fmtNum(a.rate_limited)}</td>
+      <td>${fmtNum(a.total_tokens)}</td>
+    </tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada data.</td></tr>';
+}
+
+async function loadStats() {
+  try {
+    const res = await fetch('/admin/api/stats');
+    if (!res.ok) return;
+    renderStats(await res.json());
+  } catch (e) { /* ignore transient */ }
+}
+
+async function savePool() {
+  const sec = Number($('cooldown-sec').value);
+  try {
+    const res = await fetch('/admin/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cooldownMs: Number.isFinite(sec) ? sec * 1000 : undefined }),
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d?.error?.message || ('HTTP ' + res.status));
+    toast('Pengaturan pool tersimpan');
+    loadStats();
+  } catch (e) { toast('Gagal menyimpan: ' + e.message, 'err'); }
+}
+
+async function setStrategy(strategy) {
+  try {
+    const res = await fetch('/admin/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy }),
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d?.error?.message || ('HTTP ' + res.status));
+    toast('Strategi: ' + strategy);
+    loadStats();
+  } catch (e) { toast('Gagal: ' + e.message, 'err'); }
+}
+
+async function resetMetrics() {
+  if (!confirm('Reset semua metrik token & request?')) return;
+  try {
+    await fetch('/admin/api/reset-metrics', { method: 'POST' });
+    toast('Metrik direset');
+    loadStats();
+  } catch (e) { toast('Gagal reset: ' + e.message, 'err'); }
+}
+
+document.querySelectorAll('#strategy-seg button').forEach(b => {
+  b.addEventListener('click', () => setStrategy(b.getAttribute('data-strategy')));
+});
+$('btn-save-pool').addEventListener('click', savePool);
+$('btn-reset-metrics').addEventListener('click', resetMetrics);
+document.querySelectorAll('[data-cd]').forEach(b => {
+  b.addEventListener('click', () => {
+    $('cooldown-sec').value = b.getAttribute('data-cd');
+    savePool();
+  });
+});
+
+loadStats();
+setInterval(loadStats, 4000);
+</script>
+</body>
+</html>

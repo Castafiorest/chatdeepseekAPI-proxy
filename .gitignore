@@ -7,6 +7,11 @@ deepseek-auth.json
 deepseek-accounts.json
 # Runtime-added auth files contain secrets — keep the dir, ignore its contents.
 data/accounts/*.json
+# Multi-account pool written by the Web UI / scripts/add_account.js.
+accounts/*.json
+accounts/*.bak
+accounts/*.duplicate-bak
+.chrome-profile-*/
 .chrome-profile-deepseek/
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/
@@ -14,3 +19,5 @@ data/accounts/*.json
 /tmp/deepseek_response_*
 .DS_Store
 *.pdf
+# Runtime pool settings written by the Web UI.
+pool-settings.json

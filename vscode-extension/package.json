@@ -1,0 +1,105 @@
+{
+  "name": "freedeepseekapi-copilot",
+  "displayName": "FreeDeepseekAPI (Local Proxy)",
+  "description": "BYOK language-model provider for GitHub Copilot Chat that talks to the local FreeDeepseekAPI proxy (OpenAI-compatible DeepSeek Web bridge) on 127.0.0.1:9655.",
+  "version": "0.1.0",
+  "publisher": "freedeepseekapi",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "freedeepseekapi",
+        "displayName": "FreeDeepseekAPI",
+        "configuration": {
+          "properties": {
+            "apiKey": {
+              "type": "string",
+              "secret": true,
+              "title": "API Key",
+              "description": "Optional bearer token sent as Authorization: Bearer <key>. Leave blank when the local proxy has no PROXY_API_KEY set."
+            }
+          }
+        }
+      }
+    ],
+    "configuration": {
+      "title": "FreeDeepseekAPI",
+      "properties": {
+        "freedeepseekapi.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:9655/v1",
+          "description": "Base URL of the local FreeDeepseekAPI proxy (OpenAI-compatible). Example: http://127.0.0.1:9655/v1"
+        },
+        "freedeepseekapi.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token. Only needed if the proxy was started with PROXY_API_KEY."
+        },
+        "freedeepseekapi.extraModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra model ids to expose in the Copilot model picker (in addition to the built-in DeepSeek aliases)."
+        },
+        "freedeepseekapi.requestTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "Per-request timeout in milliseconds."
+        },
+        "freedeepseekapi.debugLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log request/response details to the FreeDeepseekAPI output channel."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "freedeepseekapi.setApiKey",
+        "title": "FreeDeepseekAPI: Set API Key",
+        "category": "FreeDeepseekAPI"
+      },
+      {
+        "command": "freedeepseekapi.clearApiKey",
+        "title": "FreeDeepseekAPI: Clear API Key",
+        "category": "FreeDeepseekAPI"
+      },
+      {
+        "command": "freedeepseekapi.testConnection",
+        "title": "FreeDeepseekAPI: Test Connection",
+        "category": "FreeDeepseekAPI"
+      },
+      {
+        "command": "freedeepseekapi.refreshModels",
+        "title": "FreeDeepseekAPI: Refresh Models",
+        "category": "FreeDeepseekAPI"
+      },
+      {
+        "command": "freedeepseekapi.showOutput",
+        "title": "FreeDeepseekAPI: Show Output Log",
+        "category": "FreeDeepseekAPI"
+      },
+      {
+        "command": "freedeepseekapi.openSettings",
+        "title": "FreeDeepseekAPI: Open Settings",
+        "category": "FreeDeepseekAPI"
+      }
+    ]
+  },
+  "scripts": {
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository"
+  }
+}

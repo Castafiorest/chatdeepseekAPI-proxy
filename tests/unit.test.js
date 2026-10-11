@@ -525,6 +525,135 @@ test('context-too-long detector recognizes DeepSeek localized errors', () => {
   assert.equal(serverInternals.isContextTooLongError({ content: 'Temporary backend overload' }), false);
 });
 
+test('rate-limit detector recognizes DeepSeek throttling in-stream and in HTTP bodies', () => {
+  assert.equal(serverInternals.isRateLimitError({ content: 'Слишком частые сообщения. Повторите попытку позже.' }), true);
+  assert.equal(serverInternals.isRateLimitError({ message: 'DeepSeek upstream HTTP 502: Слишком частые сообщения. Повторите попытку позже.' }), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Too many requests, please slow down' }), true);
+  assert.equal(serverInternals.isRateLimitError({ type: 'rate_limit_error' }), true);
+  assert.equal(serverInternals.isRateLimitError({ content: '请求过于频繁，请稍后再试' }), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Temporary backend overload' }), false);
+  assert.equal(serverInternals.isRateLimitError(null), false);
+});
+
+test('rate-limit cooldown marks the account and returns its id', () => {
+  const account = { id: 'account_7', failures: 0, cooldownUntil: 0 };
+  const id = serverInternals.cooldownAccountForRateLimit(account, 'test');
+  assert.equal(id, 'account_7');
+  assert.equal(account.failures, 1);
+  assert.ok(account.cooldownUntil > Date.now());
+  assert.equal(serverInternals.cooldownAccountForRateLimit(null), null);
+});
+
+test('admin auth normalization accepts ready auth files and browser cookie exports', () => {
+  const ready = serverInternals.normalizeAuthInput({ token: 'Bearer abc', cookie: 'a=1; b=2', hif_dliq: 'x' });
+  assert.equal(ready.token, 'abc');
+  assert.equal(ready.cookie, 'a=1; b=2');
+  assert.equal(ready.hif_dliq, 'x');
+  assert.deepEqual(serverInternals.validateAuthInput(ready), []);
+
+  const exportCookies = serverInternals.normalizeAuthInput({
+    access_token: 'tok',
+    cookies: [{ name: 'sessionid', value: 's1' }, { name: 'other', value: 'o' }],
+  });
+  assert.equal(exportCookies.token, 'tok');
+  assert.equal(exportCookies.cookie, 'sessionid=s1; other=o');
+
+  const missing = serverInternals.normalizeAuthInput({});
+  assert.deepEqual(serverInternals.validateAuthInput(missing), ['token missing', 'cookie missing']);
+});
+
+test('admin account file names are sanitized against path traversal', () => {
+  assert.equal(serverInternals.sanitizeAccountFileName('account2'), 'account2.json');
+  assert.equal(serverInternals.sanitizeAccountFileName('acc 2.json'), 'acc_2.json');
+  const traversal = serverInternals.sanitizeAccountFileName('../../etc/passwd');
+  assert.ok(!traversal.includes('/') && !traversal.includes('\\'), 'must not contain path separators');
+  assert.ok(!traversal.startsWith('.'), 'must not start with a dot');
+  assert.equal(serverInternals.sanitizeAccountFileName(''), 'account.json');
+});
+
+test('browser login session exposes a safe status shape and rejects finalize without a session', async () => {
+  const { BrowserLoginSession } = require('../lib/browser_login.js');
+  const session = new BrowserLoginSession({ repoRoot: path.resolve(__dirname, '..'), port: 9334, profileDir: path.join(os.tmpdir(), 'ds-login-test') });
+  const status = session.status();
+  assert.equal(status.state, 'idle');
+  assert.equal(typeof status.chrome_found, 'boolean');
+  assert.equal(status.error, null);
+  await assert.rejects(() => session.finalize(), /No active browser login session/);
+});
+
+test('account test script discovers the accounts directory and builds auth headers', () => {
+  const { discoverAuthPaths, buildHeaders } = require('../scripts/test_accounts.js');
+  const paths = discoverAuthPaths();
+  assert.ok(Array.isArray(paths));
+  const headers = buildHeaders({ token: 'tok', cookie: 'a=1', hif_dliq: 'd', hif_leim: 'l' });
+  assert.equal(headers.Authorization, 'Bearer tok');
+  assert.equal(headers.Cookie, 'a=1');
+  assert.equal(headers['x-hif-dliq'], 'd');
+  assert.equal(headers['x-hif-leim'], 'l');
+});
+
+test('pool settings accept only known strategies and sane cooldowns', () => {
+  const original = serverInternals.getPoolSettings();
+  try {
+    assert.deepEqual(serverInternals.setPoolSettings({ strategy: 'least-used', cooldownMs: 120000, persist: false }), { strategy: 'least-used', cooldownMs: 120000 });
+    assert.equal(serverInternals.setPoolSettings({ strategy: 'bogus', persist: false }).strategy, 'least-used');
+    // Cooldown 0 is valid and means "disabled".
+    assert.equal(serverInternals.setPoolSettings({ cooldownMs: 0, persist: false }).cooldownMs, 0);
+    // Negative values are rejected (kept at previous value).
+    assert.equal(serverInternals.setPoolSettings({ cooldownMs: -5, persist: false }).cooldownMs, 0);
+    assert.equal(serverInternals.setPoolSettings({ cooldownMs: 300000, persist: false }).cooldownMs, 300000);
+  } finally {
+    serverInternals.setPoolSettings({ ...original, persist: false });
+  }
+});
+
+test('cooldownEnabled reflects whether the pool locks accounts out', () => {
+  const original = serverInternals.getPoolSettings();
+  try {
+    serverInternals.setPoolSettings({ cooldownMs: 0, persist: false });
+    assert.equal(serverInternals.cooldownEnabled(), false);
+    serverInternals.setPoolSettings({ cooldownMs: 60000, persist: false });
+    assert.equal(serverInternals.cooldownEnabled(), true);
+  } finally {
+    serverInternals.setPoolSettings({ ...original, persist: false });
+  }
+});
+
+test('per-request strategy is accepted and rotates across the ready set', () => {
+  const original = serverInternals.getPoolSettings();
+  try {
+    assert.equal(serverInternals.setPoolSettings({ strategy: 'per-request', persist: false }).strategy, 'per-request');
+    const ready = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+    const picks = new Set();
+    for (let i = 0; i < 6; i++) picks.add(serverInternals.selectAccountByStrategy(ready).id);
+    assert.equal(picks.size, 3);
+  } finally {
+    serverInternals.setPoolSettings({ ...original, persist: false });
+  }
+});
+
+test('selectAccountByStrategy spreads across the ready set and honors strategies', () => {
+  const ready = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  const original = serverInternals.getPoolSettings();
+  try {
+    serverInternals.setPoolSettings({ strategy: 'sequential', persist: false });
+    assert.equal(serverInternals.selectAccountByStrategy(ready).id, 'a');
+    assert.equal(serverInternals.selectAccountByStrategy(ready).id, 'a');
+
+    serverInternals.setPoolSettings({ strategy: 'least-used', persist: false });
+    serverInternals.recordCompletion({ accountId: 'a', model: 'm', usage: { total_tokens: 1 }, ok: true });
+    serverInternals.recordCompletion({ accountId: 'a', model: 'm', usage: { total_tokens: 1 }, ok: true });
+    assert.equal(serverInternals.selectAccountByStrategy(ready).id, 'b'); // 'b' still has 0 requests
+
+    serverInternals.setPoolSettings({ strategy: 'round-robin', persist: false });
+    const picks = new Set();
+    for (let i = 0; i < 6; i++) picks.add(serverInternals.selectAccountByStrategy(ready).id);
+    assert.equal(picks.size, 3);
+  } finally {
+    serverInternals.setPoolSettings({ ...original, persist: false });
+  }
+});
+
 test('empty-response retry keeps recovery history unless a smaller global cap requires compaction', () => {
   const system = 'SYSTEM';
   const history = '[Previous conversation]\nUser: old\nAssistant: answer\n\n[Continue from here]\n\n';
@@ -733,3 +862,33 @@ test('stream helpers preserve the request-level exact CORS origin', () => {
     assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
   }
 });
+
+test('auto-router correctly directs coding, web search, and casual queries', () => {
+  const { routeModel, detectWebSearchNeed, detectCodingAndReasoningNeed } = serverInternals;
+
+  // Coding detection
+  assert.equal(detectCodingAndReasoningNeed([{ role: 'user', content: 'Tolong refactor fungsi ini:\n```js\nconst a = 1;\n```' }]), true);
+  assert.equal(detectCodingAndReasoningNeed([{ role: 'user', content: 'Halo siapa kamu?' }]), false);
+
+  // Search detection
+  assert.equal(detectWebSearchNeed([{ role: 'user', content: 'Cari berita terkini kurs rupiah hari ini' }]), true);
+  assert.equal(detectWebSearchNeed([{ role: 'user', content: 'Buka link https://github.com/ dan baca isinya' }]), true);
+  assert.equal(detectWebSearchNeed([{ role: 'user', content: 'Halo selamat pagi' }]), false);
+
+  // Auto model routing
+  // 1. Coding -> deepseek-v4-pro
+  assert.equal(routeModel('deepseek-auto', [{ role: 'user', content: 'Bantu debug kode Python ini: def solve(): return 42' }]), 'deepseek-v4-pro');
+  // 2. Search -> deepseek-chat-search
+  assert.equal(routeModel('auto', [{ role: 'user', content: 'Siapa presiden terpilih terbaru hari ini?' }]), 'deepseek-chat-search');
+  // 3. Coding + Search -> deepseek-reasoner-search
+  assert.equal(routeModel('deepseek-auto', [{ role: 'user', content: 'Cari dokumentasi terbaru Next.js 15 dan bantu coding app router nya' }]), 'deepseek-reasoner-search');
+  // 4. Casual -> deepseek-chat
+  assert.equal(routeModel('deepseek-auto', [{ role: 'user', content: 'Halo, apa kabar?' }]), 'deepseek-chat');
+
+  // Specific model fallback when web search is requested:
+  // deepseek-v4-pro (Expert) lacks search, so fallback to deepseek-reasoner-search
+  assert.equal(routeModel('deepseek-v4-pro', [{ role: 'user', content: 'Cari berita terkini tentang DeepSeek hari ini' }]), 'deepseek-reasoner-search');
+  // deepseek-chat falls back to deepseek-chat-search
+  assert.equal(routeModel('deepseek-chat', [{ role: 'user', content: 'Cari harga saham terbaru hari ini' }]), 'deepseek-chat-search');
+});
+

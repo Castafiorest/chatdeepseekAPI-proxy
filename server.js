@@ -18,6 +18,7 @@ const readline = require('readline');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
+const { BrowserLoginSession } = require('./lib/browser_login');
 
 // Per-DeepSeek-request network timeout. Plain fetch() has NO default timeout, so a
 // stalled upstream would hang the inbound request (and pin the account) forever.
@@ -76,7 +77,7 @@ function printBanner() {
 █████   ██████  █████   █████   ██   ██ █████   █████   █████   █████
 ██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██
 ██      ██   ██ ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
-
+z
    FreeDeepseekAPI — API-прокси для DeepSeek Web Chat
    ${formatWatermark()}
 `);
@@ -128,6 +129,7 @@ function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
 }
 
 const CONTEXT_COMPACTED_HEADER = 'X-FreeDeepseek-Context-Compacted';
+const EFFECTIVE_MODEL_HEADER = 'X-DeepSeek-Effective-Model';
 function setCorsResponseHeaders(res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -135,6 +137,11 @@ function setCorsResponseHeaders(res) {
 }
 function markContextCompacted(res) {
     res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
+}
+function markEffectiveModel(res, model) {
+    if (res && typeof res.setHeader === 'function' && model) {
+        res.setHeader(EFFECTIVE_MODEL_HEADER, String(model));
+    }
 }
 
 // === Per-Agent Session Store ===
@@ -160,11 +167,107 @@ const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
 const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
     ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
     : 2;
+// Rate-limit recovery: DeepSeek reports "too many messages" either as an
+// in-stream error event or as an HTTP 502 whose body carries the rate-limit
+// text. Both are recoverable — cool the offending account down and retry on
+// another account instead of surfacing a 502 to the client.
+const configuredRateLimitRetries = Number(process.env.DEEPSEEK_MAX_RATE_LIMIT_RETRIES);
+const MAX_RATE_LIMIT_RETRIES = Number.isFinite(configuredRateLimitRetries)
+    ? Math.max(0, Math.min(10, Math.floor(configuredRateLimitRetries)))
+    : 2;
 const MIN_UPSTREAM_PROMPT_CHARS = 16000;
 const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
 const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
-    : 80000;
+    : 400000;  // default raised so long agent/coding contexts fit (chars, ~100k tokens)
+
+// === Runtime metrics + pool strategy (configurable from the Web UI) ===
+// The server tracks per-account and global token usage/request counts in memory,
+// and exposes a small mutable settings object so the admin UI can switch the
+// account-selection strategy (round-robin / least-used / sequential) live.
+const metrics = {
+    startedAt: Date.now(),
+    totals: { requests: 0, successes: 0, failures: 0, rate_limited: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, bytes_out: 0 },
+    perAccount: new Map(),   // id -> { requests, successes, failures, rate_limited, prompt_tokens, completion_tokens, total_tokens }
+    perModel: new Map(),     // model id -> count
+    recent: [],              // last N request summaries
+};
+const RECENT_LIMIT = 50;
+function makeAccountMetrics() {
+    return { requests: 0, successes: 0, failures: 0, rate_limited: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+}
+function accountMetrics(accountId) {
+    if (!metrics.perAccount.has(accountId)) metrics.perAccount.set(accountId, makeAccountMetrics());
+    return metrics.perAccount.get(accountId);
+}
+function recordRequestStart() { metrics.totals.requests++; }
+function recordCompletion({ accountId, model, usage, elapsedMs, ok = true, rateLimited = false }) {
+    const totals = metrics.totals;
+    if (ok) totals.successes++; else totals.failures++;
+    if (rateLimited) totals.rate_limited++;
+    const promptTokens = usage?.prompt_tokens || 0;
+    const completionTokens = usage?.completion_tokens || 0;
+    const totalTokens = usage?.total_tokens || (promptTokens + completionTokens);
+    totals.prompt_tokens += promptTokens;
+    totals.completion_tokens += completionTokens;
+    totals.total_tokens += totalTokens;
+
+    if (accountId) {
+        const am = accountMetrics(accountId);
+        am.requests++;
+        if (ok) am.successes++; else am.failures++;
+        if (rateLimited) am.rate_limited++;
+        am.prompt_tokens += promptTokens;
+        am.completion_tokens += completionTokens;
+        am.total_tokens += totalTokens;
+    }
+    if (model) metrics.perModel.set(model, (metrics.perModel.get(model) || 0) + 1);
+
+    metrics.recent.unshift({
+        at: Date.now(), account: accountId || null, model: model || null,
+        prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens,
+        elapsed_ms: elapsedMs || 0, ok, rate_limited: rateLimited,
+    });
+    if (metrics.recent.length > RECENT_LIMIT) metrics.recent.length = RECENT_LIMIT;
+}
+
+// Pool strategy is read on every account selection so UI changes take effect live.
+// The settings are persisted so a UI change (e.g. disabling cooldown) survives a restart.
+const POOL_SETTINGS_PATH = path.join(__dirname, 'pool-settings.json');
+const poolSettings = {
+    strategy: process.env.DEEPSEEK_POOL_STRATEGY || 'round-robin', // round-robin | least-used | sequential
+    cooldownMs: DEFAULT_ACCOUNT_COOLDOWN_MS,
+};
+function getPoolSettings() { return { ...poolSettings }; }
+function setPoolSettings(patch = {}) {
+    if (['round-robin', 'least-used', 'sequential', 'per-request'].includes(patch.strategy)) poolSettings.strategy = patch.strategy;
+    const cd = Number(patch.cooldownMs);
+    // 0 means "cooldown disabled": failure/rate-limit signals no longer lock an
+    // account out, and the pool keeps rotating on retry instead.
+    if (Number.isFinite(cd) && cd >= 0) poolSettings.cooldownMs = Math.floor(cd);
+    if (patch.persist !== false) savePoolSettings();
+    return getPoolSettings();
+}
+function cooldownEnabled() { return poolSettings.cooldownMs > 0; }
+function loadPoolSettings() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(POOL_SETTINGS_PATH, 'utf8'));
+        if (['round-robin', 'least-used', 'sequential', 'per-request'].includes(raw.strategy)) poolSettings.strategy = raw.strategy;
+        const cd = Number(raw.cooldownMs);
+        if (Number.isFinite(cd) && cd >= 0) poolSettings.cooldownMs = Math.floor(cd);
+        console.log(`[DS-API] Loaded pool settings: strategy=${poolSettings.strategy}, cooldownMs=${poolSettings.cooldownMs}`);
+    } catch (e) {
+        if (e.code !== 'ENOENT') console.error(`[DS-API] Could not read pool-settings.json: ${e.message}`);
+    }
+}
+function savePoolSettings() {
+    try {
+        fs.writeFileSync(POOL_SETTINGS_PATH, JSON.stringify({ strategy: poolSettings.strategy, cooldownMs: poolSettings.cooldownMs }, null, 2));
+    } catch (e) {
+        console.error(`[DS-API] Could not write pool-settings.json: ${e.message}`);
+    }
+}
+
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -182,6 +285,10 @@ function buildBaseHeaders(config = DS_CONFIG) {
         "Content-Type": "application/json",
     };
 }
+function resolveAccountsDir() {
+    if (process.env.DEEPSEEK_AUTH_DIR) return process.env.DEEPSEEK_AUTH_DIR;
+    return path.join(__dirname, 'accounts');
+}
 function discoverAuthPaths() {
     if (process.env.DEEPSEEK_AUTH_DIR) {
         try {
@@ -197,6 +304,17 @@ function discoverAuthPaths() {
     if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
         return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
     }
+    // Auto-discover the local accounts/ directory so the admin Web UI can add
+    // accounts without requiring DEEPSEEK_AUTH_DIR to be set. Falls back to the
+    // single default auth file when the directory is missing or empty.
+    try {
+        const autoDir = path.join(__dirname, 'accounts');
+        const files = fs.readdirSync(autoDir)
+            .filter(f => f.endsWith('.json'))
+            .sort()
+            .map(f => path.join(autoDir, f));
+        if (files.length > 0) return files;
+    } catch (e) { /* no accounts dir: use the default single-file path */ }
     return [DS_CONFIG_PATH];
 }
 function loadDeepSeekConfig({ fatal = true } = {}) {
@@ -225,6 +343,177 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
     return false;
 }
 function hasAuthConfig() { return accounts.some(a => a.config.token && a.config.cookie); }
+
+// === Admin account management (used by the Web UI) ===
+function reloadAccounts() {
+    loadDeepSeekConfig({ fatal: false });
+    return accounts.length;
+}
+
+function sanitizeAccountFileName(name) {
+    const base = String(name || '').trim().replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '');
+    const withExt = base.toLowerCase().endsWith('.json') ? base : `${base || 'account'}.json`;
+    return withExt || 'account.json';
+}
+
+function uniqueAccountPath(dir, fileName) {
+    const parsed = path.parse(fileName);
+    let candidate = path.join(dir, fileName);
+    let counter = 1;
+    while (fs.existsSync(candidate)) {
+        candidate = path.join(dir, `${parsed.name}-${counter}${parsed.ext}`);
+        counter++;
+    }
+    return candidate;
+}
+
+// Accepts a ready deepseek-auth.json object or a browser cookie export and
+// writes a normalized auth file into the accounts directory.
+function addAccountFromAuth(input, preferredName = '') {
+    const auth = normalizeAuthInput(input);
+    const errors = validateAuthInput(auth);
+    if (errors.length) {
+        const err = new Error(`Invalid auth: ${errors.join(', ')}`);
+        err.status = 400; err.type = 'invalid_auth';
+        throw err;
+    }
+    const dir = resolveAccountsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const fileName = sanitizeAccountFileName(preferredName || `account-${Date.now()}`);
+    const target = uniqueAccountPath(dir, fileName);
+    fs.writeFileSync(target, JSON.stringify(auth, null, 2), { mode: 0o600 });
+    if (process.platform !== 'win32') { try { fs.chmodSync(target, 0o600); } catch (e) { /* best effort */ } }
+    const total = reloadAccounts();
+    return { file: path.basename(target), total };
+}
+
+function removeAccountByFile(fileName) {
+    const dir = resolveAccountsDir();
+    const safe = path.basename(String(fileName || ''));
+    if (!safe || !safe.toLowerCase().endsWith('.json')) {
+        const err = new Error('A valid .json account file name is required');
+        err.status = 400; err.type = 'invalid_request';
+        throw err;
+    }
+    const target = path.join(dir, safe);
+    if (!fs.existsSync(target)) {
+        const err = new Error(`Account file not found: ${safe}`);
+        err.status = 404; err.type = 'not_found';
+        throw err;
+    }
+    fs.rmSync(target, { force: true });
+    const total = reloadAccounts();
+    return { removed: safe, total };
+}
+
+// Normalize an incoming auth payload (mirrors scripts/auth_import.js logic).
+function normalizeAuthInput(input) {
+    const src = input && typeof input === 'object' ? input : {};
+    const token = String(src.token || src.access_token || src.accessToken || src.auth_token || '').trim().replace(/^Bearer\s+/i, '');
+    let cookie = '';
+    if (typeof src.cookie === 'string') cookie = src.cookie.trim();
+    else if (typeof src.cookies === 'string') cookie = src.cookies.trim();
+    else if (Array.isArray(src.cookies)) cookie = cookieArrayToHeader(src.cookies);
+    else if (Array.isArray(src)) cookie = cookieArrayToHeader(src);
+    return {
+        token,
+        hif_dliq: String(src.hif_dliq || src['x-hif-dliq'] || ''),
+        hif_leim: String(src.hif_leim || src['x-hif-leim'] || ''),
+        cookie,
+        wasmUrl: String(src.wasmUrl || src.wasm_url || 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm'),
+    };
+}
+
+function cookieArrayToHeader(cookies) {
+    return (Array.isArray(cookies) ? cookies : [])
+        .filter(c => c && c.name && c.value)
+        .map(c => `${String(c.name).trim()}=${String(c.value).trim()}`)
+        .filter(Boolean)
+        .join('; ');
+}
+
+function validateAuthInput(auth) {
+    const errors = [];
+    if (!auth.token) errors.push('token missing');
+    if (!auth.cookie) errors.push('cookie missing');
+    return errors;
+}
+
+// Public (secret-free) account view for the Web UI.
+function accountStatusPublic(account) {
+    const status = accountStatus(account);
+    return {
+        id: status.id,
+        file: path.basename(account.file || ''),
+        ready: status.ready,
+        cooldown: status.cooldown,
+        cooldown_remaining_sec: status.cooldown_remaining_sec,
+        failures: status.failures,
+        last_used_at: status.last_used_at,
+    };
+}
+
+// === Browser login session (Web UI "Login with Chrome") ===
+// A single active login session is enough for a localhost admin tool. Each new
+// start replaces the previous one.
+let browserLoginSession = null;
+function getBrowserLogin() {
+    if (!browserLoginSession) {
+        browserLoginSession = new BrowserLoginSession({
+            repoRoot: __dirname,
+            port: process.env.DEEPSEEK_CHROME_PORT || 9334,
+            profileDir: path.join(__dirname, '.chrome-profile-login'),
+        });
+    }
+    return browserLoginSession;
+}
+
+// Actively verify one account against DeepSeek: request a PoW challenge (proves
+// the token/cookie are accepted) and optionally create a chat session. Never
+// throws — returns a structured result the admin UI can display.
+async function verifyAccount(account, { createSession = false } = {}) {
+    const result = { id: account.id, file: path.basename(account.file || ''), live: false, auth_ok: false, session_ok: null, status: null, error: null };
+    if (!account.config.token || !account.config.cookie) {
+        result.error = 'missing token or cookie';
+        return result;
+    }
+    try {
+        const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+            method: 'POST', headers: account.headers,
+            body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
+        });
+        result.status = cr.status;
+        const text = await cr.text();
+        if (!cr.ok) {
+            result.error = `PoW challenge HTTP ${cr.status}`;
+            markAccountFailure(account, cr.status, 'verify');
+            return result;
+        }
+        let json;
+        try { json = JSON.parse(text); } catch { result.error = 'non-JSON PoW response'; return result; }
+        const challenge = json?.data?.biz_data?.challenge;
+        if (!challenge) { result.error = 'no PoW challenge (auth expired or captcha required)'; return result; }
+        result.auth_ok = true;
+
+        if (createSession) {
+            const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
+                method: 'POST', headers: account.headers, body: '{}',
+            });
+            const { json: sessionJson } = await readDeepSeekJsonResponse(sr, 'verify session', account);
+            const sessionId = sessionJson?.data?.biz_data?.chat_session?.id || sessionJson?.data?.biz_data?.id;
+            result.session_ok = Boolean(sr.ok && sessionId);
+            result.session_id = sessionId || null;
+            if (!result.session_ok) result.error = `session create HTTP ${sr.status}`;
+            else result.live = true;
+        } else {
+            result.live = true;
+        }
+        return result;
+    } catch (e) {
+        result.error = e.message;
+        return result;
+    }
+}
 function accountStatus(account) {
     return {
         id: account.id,
@@ -237,7 +526,12 @@ function accountStatus(account) {
 }
 function selectAccountForSession(session) {
     const now = Date.now();
-    if (session.accountId) {
+    const perRequest = poolSettings.strategy === 'per-request';
+    // In per-request mode we deliberately ignore the sticky account so every
+    // request can land on a different account. The client (Copilot) resends the
+    // full conversation each turn, so context is preserved without a native
+    // DeepSeek session — we just reset the remote session when the account changes.
+    if (session.accountId && !perRequest) {
         const sticky = accounts.find(a => a.id === session.accountId);
         if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
         // A DeepSeek chat_session belongs to the auth account that created it.
@@ -261,9 +555,37 @@ function selectAccountForSession(session) {
         noAuth.status = 503; noAuth.type = 'no_auth';
         throw noAuth;
     }
+    const account = selectAccountByStrategy(ready);
+    if (perRequest && session.accountId && session.accountId !== account.id) {
+        // Switching accounts mid-conversation: the old DeepSeek session id is not
+        // valid under the new account, so drop it (history is resent by the client).
+        resetRemoteSession(session);
+    }
+    session.accountId = account.id;
+    return account;
+}
+// Pick an account from the ready set according to the live pool strategy:
+// - round-robin: cycle in order (fair spread)
+// - least-used:  fewest recorded requests first (balances long sessions)
+// - sequential:  always the first ready account (sticky-until-cooldown)
+// - per-request: rotate on every request (ignores sticky; see selectAccountForSession)
+function selectAccountByStrategy(ready) {
+    const strategy = poolSettings.strategy;
+    if (strategy === 'least-used') {
+        let best = ready[0];
+        let bestCount = Infinity;
+        for (const a of ready) {
+            const count = metrics.perAccount.get(a.id)?.requests || 0;
+            if (count < bestCount) { best = a; bestCount = count; }
+        }
+        return best;
+    }
+    if (strategy === 'sequential') {
+        return ready[0];
+    }
+    // round-robin and per-request both cycle; per-request just bypasses stickiness.
     const account = ready[accountRoundRobin % ready.length];
     accountRoundRobin++;
-    session.accountId = account.id;
     return account;
 }
 // Parse a Retry-After header value into a cooldown duration in ms, or null if
@@ -280,11 +602,11 @@ function parseRetryAfterMs(retryAfterRaw) {
 function markAccountFailure(account, status, reason = '', retryAfterRaw = null) {
     if (!account) return;
     account.failures++;
-    if ([401, 403, 429].includes(Number(status))) {
+    if ([401, 403, 429].includes(Number(status)) && cooldownEnabled()) {
         // On 429, honor a valid Retry-After header (seconds or HTTP-date) when present;
-        // otherwise fall back to the fixed env-configured cooldown.
+        // otherwise fall back to the live pool cooldown.
         const retryMs = Number(status) === 429 ? parseRetryAfterMs(retryAfterRaw) : null;
-        const cooldownMs = retryMs != null ? retryMs : DEFAULT_ACCOUNT_COOLDOWN_MS;
+        const cooldownMs = retryMs != null ? retryMs : poolSettings.cooldownMs;
         account.cooldownUntil = Date.now() + cooldownMs;
         console.log(`[account:${account.id}] cooldown for ${Math.round(cooldownMs / 1000)}s after HTTP ${status}${reason ? ` (${reason})` : ''}${retryMs != null ? ' (Retry-After)' : ''}`);
     }
@@ -304,6 +626,7 @@ async function readDeepSeekJsonResponse(resp, label, account) {
 }
 if (require.main === module) {
     loadDeepSeekConfig({ fatal: false });
+    loadPoolSettings();
 }
 
 function createSession() {
@@ -437,6 +760,18 @@ const MODEL_CONFIGS = {
         capabilities: { reasoning: true, web_search: false, files: false },
         supported: true,
     },
+    'deepseek-auto': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek Intelligent Auto-Router (Auto switches: coding -> v4-pro, web search -> reasoner-search/chat-search, general -> chat)',
+        capabilities: { reasoning: true, web_search: true, files: true, auto_route: true },
+        supported: true,
+    },
+    'auto': {
+        model_type: 'default', thinking_enabled: true, search_enabled: false,
+        real_model: 'DeepSeek Intelligent Auto-Router (Auto switches: coding -> v4-pro, web search -> reasoner-search/chat-search, general -> chat)',
+        capabilities: { reasoning: true, web_search: true, files: true, auto_route: true },
+        supported: true,
+    },
     'deepseek-expert-search': {
         model_type: 'expert', thinking_enabled: false, search_enabled: true,
         real_model: 'DeepSeek Web “Эксперт” + search requested, but Expert has search_feature=null in remote config',
@@ -525,6 +860,95 @@ function resolveModelConfig(model) {
 }
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
+
+function detectWebSearchNeed(messages, params = {}) {
+    if (params.web_search === true || params.search === true || params.internet === true) return true;
+    if (Array.isArray(params.tools) && params.tools.some(t => {
+        const name = String(t?.function?.name || t?.name || '').toLowerCase();
+        return name.includes('search') || name.includes('browse') || name.includes('web');
+    })) return true;
+
+    const userMsgs = (messages || [])
+        .filter(m => m && m.role === 'user')
+        .slice(-3);
+    if (userMsgs.length === 0) return false;
+    const text = userMsgs.map(m => normalizeMessageContent(m.content)).join('\n');
+    if (!text) return false;
+
+    if (/https?:\/\/\S+|www\.\S+/i.test(text)) return true;
+
+    const searchPatterns = [
+        /\b(cari|carikan|searching|browsing|riset|googling|google)\b/i,
+        /\b(berita|terbaru|terkini|terupdate|update terkini)\b/i,
+        /\b(hari ini|kemarin|minggu ini|bulan ini|tahun ini)\b/i,
+        /\b(2025|2026)\b/,
+        /\b(harga|kurs|cuaca|saham|crypto|bitcoin|btc|eth|ihsg)\b/i,
+        /\b(skor|jadwal pertandingan|klasemen|juara)\b/i,
+        /\b(siapa presiden|siapa menteri|siapa ketua|siapa pemenang)\b/i,
+        /\b(apa yang terjadi di|isu terkini|fakta terkini)\b/i,
+        /\b(search|browse|web search|fact check|latest news|recent news|current news)\b/i,
+        /\b(today|yesterday|this week|this month|this year|real-time|weather today)\b/i,
+        /\b(stock price|market cap|crypto price|exchange rate)\b/i,
+        /\b(who is the current|what is the latest|what happened in)\b/i,
+    ];
+
+    return searchPatterns.some(pattern => pattern.test(text));
+}
+
+function detectCodingAndReasoningNeed(messages, params = {}) {
+    if (params.thinking === true || params.reasoning === true) return true;
+    
+    const userMsgs = (messages || [])
+        .filter(m => m && m.role === 'user')
+        .slice(-3);
+    if (userMsgs.length === 0) return false;
+    const text = userMsgs.map(m => normalizeMessageContent(m.content)).join('\n');
+    if (!text) return false;
+
+    if (/```[\s\S]*?```/.test(text)) return true;
+    if (/\b(function|def|class|const|let|var|public|private|protected|import|export|require|interface|type|struct|fn|async|await|return|SELECT\s+.*FROM|UPDATE\s+.*SET|INSERT\s+INTO)\b/i.test(text)) return true;
+    if (/\b(stack trace|error log|exception|nullpointer|undefined is not|syntaxerror|typeerror|traceback)\b/i.test(text)) return true;
+
+    const codingPatterns = [
+        /\b(koding|coding|code|kodingan|script|program|skrip|fungsi|method|func|procedure)\b/i,
+        /\b(typescript|javascript|python|golang|java|c\+\+|c#|php|ruby|rust|swift|kotlin|dart|sql|bash|powershell|vue|react|angular|nextjs|laravel)\b/i,
+        /\b(refactor|debug|debugging|fix bug|perbaiki bug|unit test|test case|tester)\b/i,
+        /\b(algoritma|algorithm|kompleksitas|time complexity|space complexity|leetcode|big-o)\b/i,
+        /\b(api|endpoint|database|schema|query sql|migration|controller|model|middleware)\b/i,
+        /\b(step[- ]by[- ]step|langkah demi langkah|pikirkan|analisis mendalam|penalaran|berpikir|reasoning)\b/i,
+        /\b(matematika|rumus|persamaan|kalkulus|integral|derivatif|aljabar|hitung|solve|pembuktian|prove|theorem)\b/i,
+        /\b(arsitektur sistem|system design|data structure|struktur data)\b/i,
+    ];
+
+    return codingPatterns.some(pattern => pattern.test(text));
+}
+
+function routeModel(requestedModel, messages, params = {}) {
+    const req = String(requestedModel || 'deepseek-chat').toLowerCase();
+    const isAuto = req === 'auto' || req === 'deepseek-auto';
+    const autoSwitchSearch = !/^(0|false|off|no)$/i.test(String(process.env.AUTO_SWITCH_SEARCH || '1'));
+
+    const needsSearch = detectWebSearchNeed(messages, params);
+    const needsReasoning = detectCodingAndReasoningNeed(messages, params);
+
+    if (isAuto) {
+        if (needsSearch && needsReasoning) return 'deepseek-reasoner-search';
+        if (needsSearch) return 'deepseek-chat-search';
+        if (needsReasoning) return 'deepseek-v4-pro';
+        return 'deepseek-chat';
+    }
+
+    if (autoSwitchSearch && needsSearch) {
+        if (req === 'deepseek-v4-pro' || req === 'deepseek-expert' || req === 'deepseek-reasoner' || req === 'deepseek-r1') {
+            return 'deepseek-reasoner-search';
+        }
+        if (req === 'deepseek-chat' || req === 'deepseek-v3' || req === 'deepseek-default') {
+            return 'deepseek-chat-search';
+        }
+    }
+
+    return req;
+}
 
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
     const modelCfg = resolveModelConfig(model);
@@ -650,6 +1074,15 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
                 const retryAfter2 = resp2.headers.get('retry-after');
                 markAccountFailure(account, resp2.status, 'completion after session recreate', retryAfter2);
                 const errText2 = await resp2.text();
+                // DeepSeek sometimes reports throttling as HTTP 502 with the
+                // rate-limit text in the body. Cool the account down and surface
+                // a 429 so the caller can rotate/back off instead of seeing 502.
+                if (isRateLimitError(errText2)) {
+                    cooldownAccountForRateLimit(account, 'HTTP 502 rate limit (session recreate)');
+                    const rlErr = createUpstreamHttpError(429, errText2, retryAfter2);
+                    rlErr.type = 'rate_limit_error';
+                    throw rlErr;
+                }
                 throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
             }
             effectivePrompt = freshSessionPrompt;
@@ -658,6 +1091,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         // The body was consumed for diagnostics, so returning this Response
         // would hand a locked stream to readDeepSeekResponse. Surface a typed
         // error instead and retain the real upstream status/Retry-After.
+        // A 502 whose body carries the rate-limit text is really a throttle:
+        // cool the account down and report 429 so the pool can rotate.
+        if (isRateLimitError(errText)) {
+            cooldownAccountForRateLimit(account, `HTTP ${resp.status} rate limit`);
+            const rlErr = createUpstreamHttpError(429, errText, retryAfter);
+            rlErr.type = 'rate_limit_error';
+            throw rlErr;
+        }
         throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
@@ -1691,6 +2132,24 @@ function isContextTooLongError(error) {
     return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message);
 }
 
+// DeepSeek surfaces throttling as an in-stream error event (HTTP 200) or as an
+// HTTP 502 whose body carries the same text. Detect both so the account can be
+// cooled down and the request retried on a different account.
+function isRateLimitError(error) {
+    const message = typeof error === 'string'
+        ? error
+        : `${error?.content || ''} ${error?.message || ''} ${error?.type || ''}`;
+    return /слишком\s+частые|too\s+many\s+requests|rate[_\s-]*limit|429|频繁|请求过于频繁|слишком\s+много\s+запросов/i.test(message);
+}
+
+// Cool down the account that produced a rate-limit signal and return the
+// account id so callers can log/rotate. Safe to call with a null account.
+function cooldownAccountForRateLimit(account, reason = 'rate limit') {
+    if (!account) return null;
+    markAccountFailure(account, 429, reason);
+    return account.id;
+}
+
 function normalizeRetryResponse(result) {
     return {
         content: result?.content ? sanitizeContent(result.content) : '',
@@ -1764,7 +2223,12 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
-    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization)) {
+    const isAdminPath = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
+    // The admin UI is a localhost tool. When no PROXY_API_KEY is configured it is
+    // reachable without a bearer token (the server binds 127.0.0.1 by default);
+    // when a key IS configured, the same bearer auth as the API is required.
+    const adminAllowed = isAdminPath && (!PROXY_API_KEY || isProxyAuthorized(req.headers.authorization));
+    if (!isPublicProbe && !adminAllowed && !isProxyAuthorized(req.headers.authorization)) {
         res.writeHead(401, {
             'Content-Type': 'application/json',
             'WWW-Authenticate': 'Bearer',
@@ -1833,6 +2297,215 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // === Admin Web UI + account management ===
+    if (req.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/')) {
+        try {
+            const html = fs.readFileSync(path.join(__dirname, 'admin', 'index.html'));
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(html);
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Admin UI not found. Expected admin/index.html next to server.js.');
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/admin/api/accounts') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            accounts: accounts.map(accountStatusPublic),
+            total: accounts.length,
+            ready: accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= Date.now()).length,
+            accounts_dir: resolveAccountsDir(),
+            config_ready: hasAuthConfig(),
+        }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/accounts') {
+        let adminBody = '';
+        let adminTooLarge = false;
+        req.on('data', chunk => { adminBody += chunk; if (adminBody.length > 2 * 1024 * 1024) { adminTooLarge = true; req.destroy(); } });
+        req.on('end', () => {
+            if (adminTooLarge) {
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'Payload too large', type: 'payload_too_large' } }));
+                return;
+            }
+            try {
+                const payload = JSON.parse(adminBody || '{}');
+                const result = addAccountFromAuth(payload.auth || payload, payload.name || '');
+                console.log(`[DS-API] Admin added account file ${result.file} (total ${result.total})`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'added', ...result, accounts: accounts.map(accountStatusPublic) }));
+            } catch (e) {
+                res.writeHead(e.status || 400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: e.message, type: e.type || 'invalid_auth' } }));
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/accounts/delete') {
+        let adminBody = '';
+        req.on('data', chunk => { adminBody += chunk; });
+        req.on('end', () => {
+            try {
+                const payload = JSON.parse(adminBody || '{}');
+                const result = removeAccountByFile(payload.file);
+                console.log(`[DS-API] Admin removed account file ${result.removed} (total ${result.total})`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'removed', ...result, accounts: accounts.map(accountStatusPublic) }));
+            } catch (e) {
+                res.writeHead(e.status || 400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: e.message, type: e.type || 'invalid_request' } }));
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/reload') {
+        const total = reloadAccounts();
+        console.log(`[DS-API] Admin reloaded accounts (total ${total})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'reloaded', total, accounts: accounts.map(accountStatusPublic) }));
+        return;
+    }
+
+    // Token consumption + pool monitoring for the Web UI.
+    if (req.method === 'GET' && url.pathname === '/admin/api/stats') {
+        const now = Date.now();
+        const uptimeSec = Math.round((now - metrics.startedAt) / 1000);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            uptime_sec: uptimeSec,
+            totals: metrics.totals,
+            avg_tokens_per_request: metrics.totals.requests ? Math.round(metrics.totals.total_tokens / metrics.totals.requests) : 0,
+            rpm: uptimeSec > 0 ? Number((metrics.totals.requests / (uptimeSec / 60)).toFixed(2)) : 0,
+            per_model: [...metrics.perModel.entries()].map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
+            per_account: accounts.map(a => ({ id: a.id, file: path.basename(a.file || ''), ...(metrics.perAccount.get(a.id) || makeAccountMetrics()) })),
+            pool: {
+                strategy: poolSettings.strategy,
+                cooldown_ms: poolSettings.cooldownMs,
+                cooldown_enabled: cooldownEnabled(),
+                accounts_total: accounts.length,
+                accounts_ready: accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length,
+                in_flight: inFlight,
+                max_concurrent: MAX_CONCURRENT,
+                round_robin_counter: accountRoundRobin,
+            },
+            recent: metrics.recent,
+        }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/settings') {
+        let setBody = '';
+        req.on('data', chunk => { setBody += chunk; });
+        req.on('end', () => {
+            try {
+                const patch = JSON.parse(setBody || '{}');
+                const updated = setPoolSettings(patch);
+                console.log(`[DS-API] Admin updated pool settings: strategy=${updated.strategy}, cooldownMs=${updated.cooldownMs}`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'updated', pool: updated }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: e.message, type: 'invalid_request' } }));
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/reset-metrics') {
+        metrics.startedAt = Date.now();
+        metrics.totals = { requests: 0, successes: 0, failures: 0, rate_limited: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, bytes_out: 0 };
+        metrics.perAccount.clear();
+        metrics.perModel.clear();
+        metrics.recent.length = 0;
+        console.log('[DS-API] Admin reset metrics');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'reset' }));
+        return;
+    }
+
+    // Live-test every account: request a PoW challenge and (optionally) create a
+    // chat session so "connected" means DeepSeek actually accepted the auth.
+    if (req.method === 'POST' && url.pathname === '/admin/api/test') {
+        let testBody = '';
+        req.on('data', chunk => { testBody += chunk; });
+        req.on('end', async () => {
+            let createSession = true;
+            try { const p = JSON.parse(testBody || '{}'); if (p.create_session === false) createSession = false; } catch { /* default */ }
+            const startedAt = Date.now();
+            const results = [];
+            for (const account of accounts) {
+                // Serialize so DeepSeek does not see a burst of probes from one IP.
+                results.push(await verifyAccount(account, { createSession }));
+                await new Promise(r => setTimeout(r, 300));
+            }
+            const ok = results.filter(r => r.live).length;
+            console.log(`[DS-API] Admin test: ${ok}/${results.length} accounts live`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ total: results.length, live: ok, elapsed_ms: Date.now() - startedAt, results }));
+        });
+        return;
+    }
+
+    // --- Browser login flow (add account without npm run auth) ---
+    if (req.method === 'POST' && url.pathname === '/admin/api/login/start') {
+        try {
+            const status = await getBrowserLogin().start();
+            console.log(`[DS-API] Admin started browser login (state=${status.state})`);
+            res.writeHead(status.state === 'error' ? 500 : 200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(status));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: e.message, type: 'login_start_failed' } }));
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/admin/api/login/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(getBrowserLogin().status()));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/login/finalize') {
+        let loginBody = '';
+        req.on('data', chunk => { loginBody += chunk; });
+        req.on('end', async () => {
+            try {
+                let name = '';
+                try { name = JSON.parse(loginBody || '{}').name || ''; } catch { /* ignore */ }
+                const captured = await getBrowserLogin().finalize();
+                const result = addAccountFromAuth(captured.auth, name || `account-${Date.now()}`);
+                console.log(`[DS-API] Admin login captured account file ${result.file} (total ${result.total})`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    status: 'added',
+                    file: result.file,
+                    total: result.total,
+                    token_chars: captured.auth.token.length,
+                    cookies: captured.cookiesCount,
+                    accounts: accounts.map(accountStatusPublic),
+                }));
+            } catch (e) {
+                res.writeHead(e.status || 400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: e.message, type: e.type || 'login_finalize_failed' } }));
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/api/login/cancel') {
+        getBrowserLogin().cancel();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'cancelled' }));
+        return;
+    }
+
     // Reset session for a specific agent (or all if no agent specified)
     if (req.method === 'POST' && url.pathname === '/reset-session') {
         const agentId = url.searchParams.get('agent') || 'default';
@@ -1886,6 +2559,7 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         inFlight++;
+        recordRequestStart();
         let clientGone = false;
         res.on('close', () => { clientGone = true; });
         const requestStartedAt = Date.now();
@@ -1986,8 +2660,30 @@ const server = http.createServer(async (req, res) => {
             }
 
             const startTime = Date.now();
-            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+            const effectiveModel = routeModel(requestedModel, messages, params);
+            if (effectiveModel !== requestedModel) {
+                console.log(`${agentTag} [Auto-Route] ${requestedModel} -> ${effectiveModel}`);
+            }
+            markEffectiveModel(res, effectiveModel);
+            const initialCall = await (async () => {
+                let attempt = 0;
+                while (true) {
+                    try {
+                        return await askDeepSeekStream(fullPrompt, agentId, effectiveModel, freshPromptBuild.prompt);
+                    } catch (e) {
+                        const isRateLimit = e && (e.status === 429 || isRateLimitError(e.message));
+                        if (isRateLimit && attempt < MAX_RATE_LIMIT_RETRIES && !deadlineHit() && !clientGone) {
+                            attempt++;
+                            console.log(`${agentTag} initial call rate-limited (retry ${attempt}/${MAX_RATE_LIMIT_RETRIES}); rotating account.`);
+                            await new Promise(r => setTimeout(r, Math.min(1000 * attempt, 3000)));
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+            })();
             const dsResp = initialCall.resp;
+            let activeAccount = initialCall.account;
             if (initialCall.promptUsed !== fullPrompt) {
                 fullPrompt = initialCall.promptUsed;
                 if (freshPromptBuild.compacted) {
@@ -2096,18 +2792,29 @@ const server = http.createServer(async (req, res) => {
             const elapsed = Date.now() - startTime;
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
-            // Empty/context-overflow recovery. Each retry gets a smaller prompt
-            // and a fresh remote session; bounded attempts prevent retry storms.
+            // Empty/context-overflow/rate-limit recovery. Each retry gets a smaller
+            // prompt and a fresh remote session; bounded attempts prevent retry storms.
+            // Rate-limit signals additionally cool the offending account down so the
+            // retry lands on a different account (multi-account failover).
             let retryAttempt = 0;
+            let rateLimitRetryAttempt = 0;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
-                if (modelError && !contextTooLong) break;
-                if (retryAttempt >= MAX_EMPTY_RETRIES) break;
-                retryAttempt++;
+                const rateLimited = isRateLimitError(modelError);
+                if (modelError && !contextTooLong && !rateLimited) break;
+                if (rateLimited) {
+                    if (rateLimitRetryAttempt >= MAX_RATE_LIMIT_RETRIES) break;
+                    rateLimitRetryAttempt++;
+                    const cooled = cooldownAccountForRateLimit(activeAccount, 'in-stream rate limit');
+                    console.log(`${agentTag} rate limit detected (retry ${rateLimitRetryAttempt}/${MAX_RATE_LIMIT_RETRIES}); cooling account ${cooled || 'unknown'} and rotating.`);
+                } else {
+                    if (retryAttempt >= MAX_EMPTY_RETRIES) break;
+                    retryAttempt++;
+                }
 
                 const retryRatio = contextTooLong
                     ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
@@ -2119,13 +2826,18 @@ const server = http.createServer(async (req, res) => {
                     promptCompacted = true;
                     markContextCompacted(res);
                 }
-                const reason = contextTooLong ? 'context-too-long response' : 'empty response';
+                const reason = rateLimited ? 'rate-limited response' : (contextTooLong ? 'context-too-long response' : 'empty response');
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 resetRemoteSession(session);
-                // Brief delay before retry to let DeepSeek breathe
-                await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
-                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
-                const retryResult = await readDeepSeekResponse(retryResp.body);
+                // Brief delay before retry to let DeepSeek breathe. Rate-limit
+                // retries back off a little harder since the account is throttled.
+                const backoffMs = rateLimited
+                    ? Math.min(1000 * rateLimitRetryAttempt, 3000)
+                    : Math.min(500 * retryAttempt, 1500);
+                await new Promise(r => setTimeout(r, backoffMs));
+                const retryCall = await askDeepSeekStream(retryPrompt, agentId, effectiveModel);
+                activeAccount = retryCall.account || activeAccount;
+                const retryResult = await readDeepSeekResponse(retryCall.resp.body);
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
@@ -2141,7 +2853,10 @@ const server = http.createServer(async (req, res) => {
 
             if (!fullContent || fullContent.trim().length === 0) {
                 const timedOut = deadlineHit();
-                const failureClass = classifyRecoveryFailure(modelError, timedOut);
+                const rateLimited = isRateLimitError(modelError);
+                const failureClass = rateLimited
+                    ? { status: 429, type: 'rate_limit_error' }
+                    : classifyRecoveryFailure(modelError, timedOut);
                 const failure = resetRemoteSession(session);
                 const errorType = failureClass.type;
                 const errorMessage = modelError?.content
@@ -2149,7 +2864,13 @@ const server = http.createServer(async (req, res) => {
                         ? 'DeepSeek request deadline reached while recovering an empty response'
                         : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
                 console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
-                res.writeHead(failureClass.status, { 'Content-Type': 'application/json' });
+                recordCompletion({ accountId: activeAccount?.id, model: effectiveModel, elapsedMs: Date.now() - startTime, ok: false, rateLimited });
+                const failureHeaders = { 'Content-Type': 'application/json' };
+                if (rateLimited) {
+                    // Tell integrators to back off instead of hammering the pool.
+                    failureHeaders['Retry-After'] = String(Math.max(1, Math.ceil(poolSettings.cooldownMs / 1000)));
+                }
+                res.writeHead(failureClass.status, failureHeaders);
                 res.end(JSON.stringify({
                     error: {
                         message: errorMessage,
@@ -2160,6 +2881,7 @@ const server = http.createServer(async (req, res) => {
                         history_length: session.history.length,
                         account: failure.accountId,
                         retry_attempts: retryAttempt,
+                        rate_limit_retries: rateLimitRetryAttempt,
                         upstream_prompt_chars: fullPrompt.length,
                         prompt_compacted: promptCompacted,
                         model: requestedModel,
@@ -2186,7 +2908,7 @@ const server = http.createServer(async (req, res) => {
                 const continuationCall = await askDeepSeekStream(
                     'continue',
                     agentId,
-                    requestedModel,
+                    effectiveModel,
                     continuationRecoveryPrompt
                 );
                 const { resp: contResp, account: contAccount } = continuationCall;
@@ -2232,7 +2954,7 @@ const server = http.createServer(async (req, res) => {
                     freshPromptBuild.prompt,
                     '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
                 );
-                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
+                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, effectiveModel);
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
@@ -2283,6 +3005,14 @@ const server = http.createServer(async (req, res) => {
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
+
+            recordCompletion({
+                accountId: activeAccount?.id,
+                model: effectiveModel,
+                usage: openaiResponse.usage,
+                elapsedMs: elapsed,
+                ok: true,
+            });
 
             if (stream) {
                 if (apiMode === 'anthropic') {
@@ -2435,6 +3165,17 @@ module.exports = {
         isReasoningFragment,
         isDeepSeekModelErrorEvent,
         createUpstreamHttpError,
+        isRateLimitError,
+        cooldownAccountForRateLimit,
+        cooldownEnabled,
+        selectAccountByStrategy,
+        getPoolSettings,
+        setPoolSettings,
+        recordCompletion,
+        normalizeAuthInput,
+        validateAuthInput,
+        sanitizeAccountFileName,
+        cookieArrayToHeader,
         rebuildFragmentText,
         applyResponsePatchOperations,
         compactToolSchema,
@@ -2458,6 +3199,10 @@ module.exports = {
         prepareSessionForPrompt,
         sweepIdleSessions,
         sessions,
+        detectWebSearchNeed,
+        detectCodingAndReasoningNeed,
+        routeModel,
+        MODEL_CONFIGS,
         accounts,
         selectAccountForSession,
         isProxyAuthorized,

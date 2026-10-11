@@ -316,6 +316,67 @@ Why chats still appear in DeepSeek Web: the proxy works through the internal Web
 
 You can attach multiple auth files. The right model: sticky account per agent/session — the proxy does not switch accounts inside a live DeepSeek session. If an account gets `401/403/429` and goes into cooldown, the session is safely reset and a new request can move to another available account.
 
+### Easiest way: the Web UI + `accounts/` auto-discovery
+
+Starting with this build, the server **auto-discovers every `*.json` in the local
+`accounts/` directory** (no env var needed) and ships a small **Web UI** at
+`http://127.0.0.1:9655/admin`.
+
+**Option A — log in from the Web UI (no terminal needed):**
+
+1. Run `npm start` and open `http://127.0.0.1:9655/admin`.
+2. In **🔐 Tambah Akun via Login Chrome**, click **Buka Chrome & Login**. The server
+   opens a dedicated Chrome window.
+3. Log in to DeepSeek there with a **different** account and send one short message
+   (e.g. `ok`).
+4. Back in the Web UI, click **Selesai — simpan akun**. The token/cookies are captured
+   and written to `accounts/accountN.json` automatically.
+
+**Option B — one command:**
+
+```bash
+npm run auth:add
+# or: npm run auth:add -- --name account2
+```
+
+**Option C — paste an existing auth file:** in the Web UI, paste the contents of your
+`deepseek-auth.json` (or a browser cookie export) and click **Tambah akun**.
+
+The server picks up accounts on startup. If it is already running, click
+**↻ Reload dari disk** in the Web UI (or `POST /admin/api/reload`) — no restart needed.
+
+On startup you should see:
+
+```text
+[DS-API] Loaded 2 auth account(s): account_1, account_2
+```
+
+Each account **must be a different DeepSeek login**. Copying the same file twice
+still counts as one account and will not help with rate limits.
+
+### Admin endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/admin` | Web UI (localhost tool) |
+| `GET` | `/admin/api/accounts` | Secret-free account status list |
+| `POST` | `/admin/api/accounts` | Add account — body `{ "auth": {...}, "name": "account2" }` |
+| `POST` | `/admin/api/accounts/delete` | Remove account — body `{ "file": "account2.json" }` |
+| `POST` | `/admin/api/reload` | Re-read `accounts/` from disk |
+| `POST` | `/admin/api/test` | Live-test every account (PoW + optional session create) — body `{ "create_session": true }` |
+| `GET` | `/admin/api/stats` | Token/usage monitoring + pool status |
+| `POST` | `/admin/api/settings` | Update pool strategy — body `{ "strategy": "round-robin", "cooldownMs": 300000 }` |
+| `POST` | `/admin/api/reset-metrics` | Reset token/request counters |
+| `POST` | `/admin/api/login/start` | Open a Chrome window for DeepSeek login |
+| `GET` | `/admin/api/login/status` | Current login-session state |
+| `POST` | `/admin/api/login/finalize` | Capture token/cookies and save the account — body `{ "name": "account2" }` |
+| `POST` | `/admin/api/login/cancel` | Abandon the current login session |
+
+> The admin UI is a localhost-only convenience. When `PROXY_API_KEY` is set, the
+> `/admin` routes require the same `Authorization: Bearer <key>` as the API.
+
+### Manual / advanced options
+
 Option 1 — a directory with auth files:
 
 ```bash
@@ -332,20 +393,86 @@ Option 2 — a file list:
 DEEPSEEK_AUTH_PATH="./accounts/main.json,./accounts/backup.json" NON_INTERACTIVE=1 npm start
 ```
 
-How the pool works:
+### How the pool works
 
 - a new agent/session receives an available account round-robin;
 - the chosen account is pinned to the session (`sticky`);
 - on `401`, `403`, `429` the account goes into cooldown;
-- if a session's sticky account is in cooldown, the old DeepSeek session is reset so it doesn't hammer a rate-limited/expired account;
-- account status is visible in `/health` without paths to auth files and without file names;
-- auth files must be stored with `0600` permissions.
+- **rate-limit hardening:** DeepSeek reports throttling as an in-stream error or as
+  HTTP 502 with rate-limit text. Both now cool the account down, rotate to another
+  account, and retry (bounded); if all retries fail the proxy returns **429 + Retry-After**
+  instead of a bare 502;
+- account status is visible in `/health` and the Web UI, without paths to auth files;
+- auth files should be stored with `0600` permissions.
 
 Configure cooldown:
 
 ```bash
 DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 ```
+
+Cooldown can also be changed live from the Web UI (*Cooldown (detik)* field + presets).
+Set it to **0 to disable cooldown entirely** — accounts are then never locked out and
+the pool simply keeps rotating on retry. The choice is persisted to `pool-settings.json`
+and survives restarts.
+
+**Selectable strategies** (Web UI → *Strategi Pool Akun*, or `POST /admin/api/settings`):
+
+| Strategy | Behavior |
+| --- | --- |
+| `round-robin` (default) | Cycle through ready accounts when a new agent/session is created (sticky per session). |
+| `least-used` | Pick the ready account with the fewest recorded requests (sticky per session). |
+| `sequential` | Always the first ready account until it cools down (sticky per session). |
+| `per-request` | ⚡ Rotate on **every request**, ignoring stickiness — the most even spread. Context is preserved because clients (Copilot, OpenAI SDK) resend the full conversation each turn; the remote DeepSeek session is reset when the account changes. |
+
+### Monitoring (token consumption)
+
+The `/admin` Web UI shows live monitoring:
+
+- total requests, total tokens, prompt vs completion split, rate-limit count,
+  average tokens/request, requests-per-minute, in-flight requests, uptime;
+- a bar chart of tokens per request (last 50);
+- a per-account table (requests / successes / failures / rate-limits / tokens);
+- **Reset metrik** to zero the counters.
+
+Data comes from `GET /admin/api/stats`, accumulated in memory (reset on restart).
+
+### Verifying the pool is really connected
+
+Checking files on disk is not enough — you want to know DeepSeek actually accepted
+each login. Two ways:
+
+**From the Web UI:** open `/admin` and click **🔌 Test Koneksi**. The server probes
+each account (PoW challenge + chat-session create) and shows per-account results.
+
+**From the terminal:**
+
+```bash
+npm run accounts:test
+npm run accounts:test -- --no-session   # skip chat-session creation (lighter)
+npm run accounts:test -- --json         # machine-readable
+```
+
+A healthy pool prints something like:
+
+```text
+[accounts:test] Testing 4 account(s) (with chat-session create)...
+
+  account_1   account1.json          ✅ CONNECTED (session b89d0173…)
+  account_2   account2.json          ✅ CONNECTED (session c6368544…)
+  account_3   account3.json          ✅ CONNECTED (session 2e978b5a…)
+  account_4   account4.json          ✅ CONNECTED (session 091e1203…)
+
+[accounts:test] 4/4 account(s) connected.
+```
+
+Legend:
+
+- ✅ **CONNECTED** — token/cookie accepted, chat session created.
+- ⚠️ **auth OK, session failed** — login is valid but session creation failed (retry, or the account is throttled).
+- ❌ **NOT connected** — re-login that account from `/admin`.
+
+Probes are serialized so DeepSeek does not see a burst from a single IP.
 
 ## 🔑 Console auth ideas
 
