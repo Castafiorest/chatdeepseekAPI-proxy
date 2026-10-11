@@ -1,6 +1,8 @@
 # FreeDeepseekAPI-EN
 
 > 🌍 **Global English Version:** This is the English-translated and globally adapted version of the proxy. Core logic belongs to the original author (ForgetMeAI), maintained and translated for the global open-source community by Atharvotech.
+>
+> 🔧 **This fork** (`Castafiorest/chatdeepseekAPI-proxy`) adds a multi-account pool with an **Admin Web UI**, live **token/usage monitoring**, **selectable pool strategies** (round-robin / least-used / sequential / per-request), **browser login from the Web UI**, and a **VS Code Copilot BYOK provider**. See [Multi-account pool](#-multi-account-pool) and [Admin Web UI](#-admin-web-ui).
 
 FreeDeepseekAPI starts a local API server/wrapper for **DeepSeek Web Chat** ([chat.deepseek.com](https://chat.deepseek.com)) and lets you seamlessly connect DeepSeek Web to Open WebUI, LiteLLM, Hermes, Claude Code, OpenAI SDK-style clients, and other OpenAI-compatible LLM tools.
 
@@ -20,6 +22,7 @@ The project works through your regular logged-in DeepSeek account in a dedicated
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse and chat reset](#-session-reuse-and-chat-reset)
 - [Multi-account pool](#-multi-account-pool)
+- [Admin Web UI](#-admin-web-ui)
 - [Console auth ideas](#-console-auth-ideas)
 - [Verifying it works](#-verifying-it-works)
 - [Usage examples](#-usage-examples)
@@ -474,7 +477,38 @@ Legend:
 
 Probes are serialized so DeepSeek does not see a burst from a single IP.
 
-## 🔑 Console auth ideas
+## � Admin Web UI
+
+Open **`http://127.0.0.1:9655/admin`** while the proxy is running. It is a localhost-only
+tool (when `PROXY_API_KEY` is set, the same bearer token is required).
+
+The UI has four panels:
+
+1. **📊 Monitoring Token & Pool** — total requests, total tokens, prompt/completion
+   split, rate-limit count, average tokens/request, requests-per-minute, in-flight
+   requests, uptime, a bar chart of tokens per request (last 50), and a per-account
+   token table. **Reset metrik** zeroes the counters.
+2. **⚙️ Strategi Pool Akun** — switch the account-selection strategy live
+   (`round-robin` / `least-used` / `sequential` / `per-request`) and set the cooldown
+   (presets: disabled / 30s / 1m / 5m / 10m). Changes persist to `pool-settings.json`.
+3. **🔐 Tambah Akun via Login Chrome** — add an account without `npm run auth`: the
+   server opens a dedicated Chrome window, you log in, then click **Selesai — simpan akun**.
+4. **Daftar Akun** — per-account status (ready / cooldown / invalid), **🔌 Test Koneksi**
+   (live PoW + session probe), **↻ Reload dari disk**, and delete.
+
+### VS Code Copilot (BYOK)
+
+The `vscode-extension/` folder contains a small BYOK language-model provider
+(vendor `freedeepseekapi`) so Copilot Chat can use this proxy without colliding with
+the official DeepSeek provider or the generic 9Router bridge. Build and install:
+
+```powershell
+cd vscode-extension
+npm run package
+code --install-extension freedeepseekapi-copilot-0.1.0.vsix
+```
+
+## �🔑 Console auth ideas
 
 The password flow from PR #3 can be implemented, but it's safer not to store the password and not to make it the default. A proper implementation:
 
